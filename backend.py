@@ -501,6 +501,111 @@ def render_prompts(question: str, context: str) -> tuple[str, str]:
 # 4. TWO-PASS LOGITS  (the decoding primitive)
 # ======================================================================================
 
+class _TwoPassCache:
+    """KV state for ONE (question, context) pair, both passes.
+
+    This is the cache invariant #8 refers to. gate1.phase_decode iterates
+    sorted(work), so every tau for one (qid, context_kind) arrives consecutively: the
+    prompt prefill is paid once per instance and reused across the whole tau grid, and
+    only the generated suffix is rolled back between them.
+
+    gate1 does NOT cache here -- it dedups whole decode units by (qid, context_kind,
+    tau). Two cache layers would diverge; this one is the only place KV state lives.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.caches = None          # (theta, ctx) DynamicCache pair
+        self.prompt_lens = None     # (theta, ctx) prompt token counts
+        self.gen: list[int] = []    # generated tokens currently in the caches
+        self.last = None            # (log_p_theta, log_p_ctx) at the current position
+        self.prompt_last = None     # ... at the end of the prompt, i.e. prefix == []
+        self.stats = {"prefills": 0, "forward_steps": 0, "calls": 0, "hits": 0,
+                      "rollbacks": 0}
+
+
+_CACHE = _TwoPassCache()
+
+
+def _forward(ids, cache, past_len):
+    """One incremental forward pass. Returns float32 normalized log-probs at the last
+    position. `ids` is only the NEW tokens; `cache` holds everything before them."""
+    import torch
+
+    _, model = _load()
+    total = past_len + ids.shape[1]
+    mask = torch.ones((1, total), dtype=torch.long, device=model.device)
+    with torch.inference_mode():
+        out = model(input_ids=ids, attention_mask=mask, past_key_values=cache,
+                    use_cache=True)
+    # log_softmax, not raw logits: gate1 forms (1-tau)*log_p_theta + tau*log_p_ctx,
+    # which is only a valid unnormalized log-density if both terms are normalized.
+    logp = torch.log_softmax(out.logits[0, -1, :].float(), dim=-1)
+    return out.past_key_values, logp.cpu().numpy().astype(np.float32)
+
+
+def _reset(question: str, context: str):
+    """Prefill both passes for a new (question, context). The expensive step: the
+    document is ~150 tokens, the generated suffix is at most 32."""
+    import torch
+    from transformers import DynamicCache
+
+    ids_theta = _encode(_build_prompt(question, None))
+    ids_ctx = _encode(_build_prompt(question, context))
+    c_theta, lp_theta = _forward(ids_theta, DynamicCache(), 0)
+    c_ctx, lp_ctx = _forward(ids_ctx, DynamicCache(), 0)
+
+    _CACHE.key = (question, context)
+    _CACHE.caches = (c_theta, c_ctx)
+    _CACHE.prompt_lens = (ids_theta.shape[1], ids_ctx.shape[1])
+    _CACHE.gen = []
+    _CACHE.last = (lp_theta, lp_ctx)
+    # Kept for the whole instance: gate1 restarts at prefix == [] for every tau, and
+    # this is the position it lands on. Without it, each restart would re-prefill.
+    _CACHE.prompt_last = (lp_theta, lp_ctx)
+    _CACHE.stats["prefills"] += 1
+    del torch
+
+
+def _rollback(n_keep: int) -> bool:
+    """Crop both caches back to n_keep generated tokens. Returns False if the installed
+    transformers cannot crop, in which case the caller re-prefills."""
+    theta, ctx = _CACHE.caches
+    if not (hasattr(theta, "crop") and hasattr(ctx, "crop")):
+        return False
+    pt, pc = _CACHE.prompt_lens
+    theta.crop(pt + n_keep)
+    ctx.crop(pc + n_keep)
+    _CACHE.gen = _CACHE.gen[:n_keep]
+    # `last` described the position we just cropped away. Anything that returned it now
+    # would hand back a distribution from a different prefix -- silently, and only for
+    # the second and later tau of each instance.
+    _CACHE.last = None
+    _CACHE.stats["rollbacks"] += 1
+    return True
+
+
+def cache_stats() -> dict:
+    """Instrumentation for the HANDOFF Task 4 checkpoint. Not called by gate1."""
+    return dict(_CACHE.stats)
+
+
+def is_eos(token_id: int) -> bool:
+    """Stop condition for gate1.greedy_decode. Llama-3.1 ends turns with <|eot_id|>
+    (128009), not only <|end_of_text|>, so the generation_config list is the authority."""
+    tok, model = _load()
+    ids = getattr(model.generation_config, "eos_token_id", None) or tok.eos_token_id
+    if isinstance(ids, int):
+        ids = [ids]
+    return int(token_id) in set(ids)
+
+
+def detokenize(token_ids: list[int]) -> str:
+    """Generated tokens -> the answer string gate1 scores with alias_match."""
+    tok, _ = _load()
+    return tok.decode(token_ids, skip_special_tokens=True).strip()
+
+
 def next_token_distributions(
     question: str,
     context: str,
@@ -529,4 +634,52 @@ def next_token_distributions(
     arithmetic, not measurements, and have been wrong before. If throughput implies more
     than ~3 GPU-hours for Phase 4, stop and report rather than shrinking the grids.
     """
-    raise NotImplementedError
+    prefix = list(generated_prefix)
+    _CACHE.stats["calls"] += 1
+
+    if _CACHE.key != (question, context):
+        _reset(question, context)
+
+    # How much of the cached suffix the request still agrees with.
+    common = 0
+    for a, b in zip(_CACHE.gen, prefix):
+        if a != b:
+            break
+        common += 1
+
+    if common == len(_CACHE.gen) == len(prefix) and _CACHE.last is not None:
+        _CACHE.stats["hits"] += 1
+        return _CACHE.last                      # same position as the previous call
+
+    if not prefix:
+        # Start of a decode -- gate1 lands here once per tau. The prompt-final position
+        # is already known, so roll the suffix off and answer from prefill.
+        if _CACHE.gen and not _rollback(0):
+            _reset(question, context)
+        _CACHE.stats["hits"] += 1
+        return _CACHE.prompt_last
+
+    # Keep at most len(prefix)-1 tokens, so at least one token is always fed and `last`
+    # is always recomputed for the position actually being asked about. Re-feeding one
+    # token is far cheaper than re-prefilling the document.
+    keep = min(common, len(prefix) - 1)
+    if len(_CACHE.gen) > keep and not _rollback(keep):
+        _reset(question, context)               # cannot crop -> rebuild from the prompt
+        keep = 0
+
+    new = prefix[keep:]
+
+    import torch
+
+    _, model = _load()
+    ids = torch.tensor([new], dtype=torch.long, device=model.device)
+    theta, ctx = _CACHE.caches
+    pt, pc = _CACHE.prompt_lens
+    theta, lp_theta = _forward(ids, theta, pt + keep)
+    ctx, lp_ctx = _forward(ids, ctx, pc + keep)
+
+    _CACHE.caches = (theta, ctx)
+    _CACHE.gen = prefix
+    _CACHE.last = (lp_theta, lp_ctx)
+    _CACHE.stats["forward_steps"] += 1
+    return _CACHE.last

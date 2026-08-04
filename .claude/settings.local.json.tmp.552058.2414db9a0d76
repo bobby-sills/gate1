@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /tmp/claude-1000/-home-bobby-Coding-proposal-test/2d0659af-236e-4f25-bda3-d4fa9e3b6dc1/scratchpad)",
+      "Bash(gh api *)",
+      "Bash(curl -s -r 0-6000 https://raw.githubusercontent.com/byronBBL/Context-DPO/main/ConFiQA/ConFiQA-QA.json -o head.txt)",
+      "Bash(python3 -c \"print\\(open\\('head.txt'\\).read\\(\\)[:5000]\\)\")",
+      "Bash(curl -s -H \"Range: bytes=0-8000\" https://raw.githubusercontent.com/byronBBL/Context-DPO/master/ConFiQA/ConFiQA-QA.json -o head.txt)",
+      "Bash(python3 -c \"print\\(open\\('head.txt'\\).read\\(\\)[:6000]\\)\")",
+      "Bash(mkdir -p \"/home/bobby/Coding/proposal test/data\")",
+      "Bash(curl -sL https://raw.githubusercontent.com/byronBBL/Context-DPO/master/ConFiQA/ConFiQA-QA.json -o \"/home/bobby/Coding/proposal test/data/ConFiQA-QA.json\")",
+      "Bash(python3 -)",
+      "Bash(timeout 240 nix-shell -p \"python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)\" --run \"python -c 'import numpy,pandas;print\\(numpy.__version__, pandas.__version__\\)'\")",
+      "Bash(git init *)",
+      "Bash(printf 'data/\\\\noutputs/\\\\n__pycache__/\\\\n*.pyc\\\\n')",
+      "Bash(git add *)",
+      "Bash(git -c user.name=\"Claude\" -c user.email=\"noreply@anthropic.com\" commit -q -m \"Initial commit: gate1 runner, protocol, handoff, backend stubs\")",
+      "Bash(GATE1_OUT=./outputs nix-shell -p \"python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)\" --run \"python gate1.py pool data/ConFiQA-QA.json data/FiQA.json\")",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: implement load_pool \\(Task 1\\) *)",
+      "Bash(nix-shell -p *)",
+      "Bash(GATE1_OUT=./outputs nix-shell -p 'python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)' --run 'python - <<'\\\\''EOF'\\\\'' *)",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: sample_closed_book + deterministic_features \\(Task 2\\) *)",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: alias hygiene + post-hoc filter 4 \\(leakage\\), per checkpoint 1 *)",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: render_prompts \\(Task 3\\) *)",
+      "Bash(PYTHONHASHSEED=0 nix-shell -p \"python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)\" --run \"python /tmp/claude-1000/-home-bobby-Coding-proposal-test/2d0659af-236e-4f25-bda3-d4fa9e3b6dc1/scratchpad/test_cache.py\")",
+      "Bash(PYTHONHASHSEED=0 nix-shell -p \"python3.withPackages\\(ps: [ps.torch ps.transformers ps.numpy ps.pandas]\\)\" --run \"python /tmp/claude-1000/-home-bobby-Coding-proposal-test/2d0659af-236e-4f25-bda3-d4fa9e3b6dc1/scratchpad/test_real.py\")",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: next_token_distributions + is_eos + detokenize \\(Task 4\\) *)"
+    ]
+  }
+}
