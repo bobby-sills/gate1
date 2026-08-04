@@ -40,6 +40,7 @@ class RawInstance:
     cf_aliases: list[str]          # counterfactual answer + aliases, non-empty
     factual_context: str           # passage supporting the factual answer (FiQA)
     counterfactual_context: str    # passage supporting the counterfactual (ConFiQA)
+    relation: str                  # ConFiQA predicate, e.g. "composer" -- see FUNCTIONAL
 
 
 # --------------------------------------------------------------------------------------
@@ -70,6 +71,66 @@ QID_LEN = 16
 # not on the raw string: "U.S." is 4 raw characters but normalizes to "us", and it is
 # the normalized form that gate1.alias_match substring-tests. See _clean_aliases.
 MIN_ALIAS_CHARS = 3
+
+
+# --------------------------------------------------------------------------------------
+# Relation classification -- filters 5 and 6, added after the Phase 2 label read.
+#
+# FUNCTIONAL: one true object per subject. ONE_TO_MANY: the subject genuinely has
+# several and ConFiQA picked one, so "does the model know this fact" is not well posed
+# -- the same well-posedness argument PROTOCOL 1.1 uses to exclude the multi-hop
+# subsets. This is not an assumption: measured on the full 4207-row pool, ONE_TO_MANY
+# rows are labelled `unknown` 63% of the time against 34% for FUNCTIONAL, with an
+# identical majority-class share (24%), which is what a label measuring "did the model
+# name the particular one ConFiQA picked" looks like.
+#
+# TEMPORAL: functional at any instant, but the holder changes over time, so a model
+# that knows a different-era holder scores wrong. Excluded from Gate 1 and tagged, not
+# discarded -- these are the legitimate-update case for a possible Gate 2.
+#
+# DROP: structurally defective in ConFiQA. See the note on each.
+# --------------------------------------------------------------------------------------
+FUNCTIONAL = (
+    "spouse", "composer", "country of citizenship", "director", "sport", "religion",
+    "native language", "performer", "official language", "capital", "continent",
+    "language of work or name", "headquarters location", "currency", "author",
+)
+ONE_TO_MANY = (
+    "award received", "genre", "member of", "field of work", "member of sports team",
+    "employer", "record label", "ethnic group", "work location", "position played",
+    "position held", "developer", "owned by", "founded by",
+    "country of origin",   # co-productions; Wikidata lists all of them
+    "creator",             # multiple credited creators
+)
+TEMPORAL = (
+    "head of state", "head of government", "chairperson", "head coach",
+    "chief executive officer",
+)
+DROP_RELATIONS = {
+    "follows": "54% of rows name the gold answer in the question -- the template renders "
+               "(X, follows, Y) in both directions inconsistently",
+    "country": "43% tautologous -- 'What country is Panama?' -> 'Panama'",
+    "location": "too vague to be well posed",
+    "capital of": "4 of 5 rows self-answering",
+}
+
+RELATION_CLASS = {}
+for _r in FUNCTIONAL:
+    RELATION_CLASS[_r] = "FUNCTIONAL"
+for _r in ONE_TO_MANY:
+    RELATION_CLASS[_r] = "ONE_TO_MANY"
+for _r in TEMPORAL:
+    RELATION_CLASS[_r] = "TEMPORAL"
+for _r in DROP_RELATIONS:
+    RELATION_CLASS[_r] = "DROP"
+
+
+def _relation(row: dict) -> str:
+    """orig_path_labeled is "[('Bad Boys for Life', 'composer', 'Lorne Balfe')]"."""
+    try:
+        return str(ast.literal_eval(row["orig_path_labeled"])[0][1])
+    except (ValueError, SyntaxError, IndexError, KeyError, TypeError):
+        return "?"
 
 
 def _aliases(row: dict, which: str) -> list[str]:
@@ -195,6 +256,9 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
       2. drop rows where any cf_alias normalizes to any gold_alias (an alias collision
          silently converts a resistance instance into an agreement instance)
       3. drop rows where the two contexts differ in more than the target entity
+      4. POST-HOC: drop rows where the other condition's answer survives in the passage
+      5. POST-HOC: keep FUNCTIONAL relations only (see RELATION_CLASS)
+      6. POST-HOC: drop rows whose question contains its own answer
 
     Use gate1.normalize() for filter 2 so the matcher and the filter agree.
 
@@ -285,10 +349,35 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
     attrition["dropped_filter_4_total"] = len(stage3) - len(stage4)
     attrition["after_filter_4"] = len(stage4)
 
+    # ---- filter 5 (POST-HOC): keep FUNCTIONAL relations only --------------------------
+    by_class = {}
+    for t in stage4:
+        by_class.setdefault(RELATION_CLASS.get(_relation(t[0]), "UNCLASSIFIED"), []).append(t)
+    stage5 = by_class.get("FUNCTIONAL", [])
+    attrition["filter_5_status"] = ("POST-HOC, added after the Phase 2 label read -- "
+                                    "not one of the three pre-registered filters")
+    attrition["filter_5_class_counts"] = {k: len(v) for k, v in sorted(by_class.items())}
+    attrition["dropped_non_functional_relation"] = len(stage4) - len(stage5)
+    attrition["after_filter_5"] = len(stage5)
+    if by_class.get("UNCLASSIFIED"):
+        unk = sorted({_relation(t[0]) for t in by_class["UNCLASSIFIED"]})
+        print(f"WARNING: {len(unk)} relation(s) not in RELATION_CLASS, dropped as "
+              f"non-FUNCTIONAL: {unk}", file=sys.stderr)
+
+    # ---- filter 6 (POST-HOC): the question contains its own answer ---------------------
+    # ONE GLOBAL RULE, deliberately the same matcher as labels and scoring (invariant #3).
+    # If alias_match fires on the question text itself no knowledge is being measured.
+    # 156/4207 pool-wide; concentrated in relations filter 5 already removes, but the
+    # rule is applied everywhere rather than per relation.
+    stage6 = [t for t in stage5 if not gate1.alias_match(t[0]["question"], t[2])]
+    attrition["filter_6_status"] = "POST-HOC, one global rule -- gold alias in question"
+    attrition["dropped_self_answering_question"] = len(stage5) - len(stage6)
+    attrition["after_filter_6"] = len(stage6)
+
     # ---- build, dropping any qid hash collision ---------------------------------------
     instances, seen = [], set()
     dup = 0
-    for r, subj, gold, cf in stage4:
+    for r, subj, gold, cf in stage6:
         qid = _make_qid(r)
         if qid in seen:
             dup += 1
@@ -302,6 +391,7 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
             cf_aliases=cf,
             factual_context=r["orig_context"].strip(),
             counterfactual_context=r["cf_context"].strip(),
+            relation=_relation(r),
         ))
     attrition["dropped_duplicate_qid"] = dup
     attrition["final"] = len(instances)

@@ -12,6 +12,11 @@ Implement backend.py. Run phases in order:
     python gate1.py sweep     # Phase 4b  score every config from cache (CPU only)
     python gate1.py analyze   # Phase 5-7 metrics, bootstrap, decision
 
+`cells` writes two sets: cells.jsonl (relation-matched, the primary run) and
+cells_unmatched.jsonl (uniform subsample, the pre-registered secondary run, PROTOCOL 3.3).
+Append `--unmatched` to decode/sweep/analyze to run the secondary arm; it reads
+cells_unmatched.jsonl and writes sweep_unmatched.csv. If the two disagree, report it.
+
 `labels` and `decode` are the only GPU-bound steps. Both append to JSONL and skip
 completed work on restart, so a Colab disconnect costs the current unit and nothing more.
 Re-run the same command to resume.
@@ -74,6 +79,12 @@ elif os.path.exists("/content") and not OUT.startswith("/content/drive"):
 
 RNG = np.random.default_rng(SEED)
 
+# Which cell set the downstream phases operate on. `--unmatched` selects the
+# pre-registered secondary run (see PROTOCOL 3.3). generations.jsonl is keyed by
+# (qid, context_kind, tau), so the two runs share decode work wherever they overlap.
+CELLS_FILE = "cells.jsonl"
+SWEEP_FILE = "sweep.csv"
+
 
 # ======================================================================================
 # JSONL checkpoint layer
@@ -94,10 +105,31 @@ def read_jsonl(name: str) -> list[dict]:
             line = line.strip()
             if line:
                 try:
-                    rows.append(json.loads(line))
+                    r = json.loads(line)
                 except json.JSONDecodeError:
-                    pass          # truncated final line from a hard kill
+                    continue      # truncated final line from a hard kill
+                # A leading {"_meta": true, ...} header row carries provenance (see
+                # _write_cells). It is not data and must never reach a DataFrame of rows.
+                if isinstance(r, dict) and r.get("_meta"):
+                    continue
+                rows.append(r)
     return rows
+
+
+def read_meta(name: str) -> dict:
+    """The {"_meta": true, ...} header row of a JSONL file, or {} if there is none."""
+    p = _path(name)
+    if not os.path.exists(p):
+        return {}
+    with open(p) as f:
+        for line in f:
+            if line.strip():
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    return {}
+                return r if isinstance(r, dict) and r.get("_meta") else {}
+    return {}
 
 
 class Appender:
@@ -252,9 +284,38 @@ def phase_sanity():
         print("\n  WARNING: off-diagonal below stop threshold. The sweep is unlikely "
               "to show anything regardless of the arms.")
 
-    json.dump({"discard_rate": discard_rate, "n_known": n_known,
-               "n_unknown": n_unknown, "off_diagonal": float(off)},
-              open(_path("sanity.json"), "w"), indent=2)
+    summary = {"discard_rate": discard_rate, "n_known": n_known,
+               "n_unknown": n_unknown, "off_diagonal": float(off)}
+
+    # ---- relation mix, on the pool and on the built cells ------------------------------
+    if "relation" in kept.columns:
+        pool_tvd = relation_mix_tvd(kept)
+        summary["pool_relation_mix_tvd"] = pool_tvd
+        print(f"\npool relation-mix TVD (known vs unknown): {pool_tvd:.3f}")
+        print("  (~0.07 is the sampling null at these sizes, not 0)")
+        rel = pd.crosstab(kept.relation, kept.knowledge, normalize="columns")
+        print(rel.round(3).sort_values("known", ascending=False))
+
+    for name, label in (("cells.jsonl", "MATCHED (primary)"),
+                        ("cells_unmatched.jsonl", "UNMATCHED (secondary)")):
+        meta = read_meta(name)
+        if not meta:
+            continue
+        tvd = meta.get("relation_mix_tvd")
+        summary[f"{name}_relation_mix_tvd"] = tvd
+        print(f"\n{label} -- {name}")
+        print(f"  cell sizes        : {meta.get('cell_sizes')}")
+        print(f"  relation-mix TVD  : {tvd:.3f}")
+        if meta.get("matched") and tvd is not None and tvd > 0.07:
+            print("  WARNING: TVD above the ~0.07 sampling null AFTER matching. The "
+                  "match did not take -- do not proceed to decode.")
+        for cell in ("resistance", "correction"):
+            mix = (meta.get("relation_mix") or {}).get(cell, {})
+            top = sorted(mix.items(), key=lambda x: -x[1])[:6]
+            print(f"  {cell:<11} n={sum(mix.values()):<4} "
+                  f"{', '.join(f'{k} {v}' for k, v in top)}")
+
+    json.dump(summary, open(_path("sanity.json"), "w"), indent=2)
 
 
 CELLS = {
@@ -265,39 +326,136 @@ CELLS = {
 }
 
 
+def relation_mix_tvd(df: pd.DataFrame) -> float:
+    """Total variation distance between the relation mixes of the `known` and `unknown`
+    questions in `df`. The correction cell draws from `unknown` and the resistance cell
+    from `known` (see CELLS), so this is exactly how far apart the two headline cells
+    are in relation composition.
+
+    Not 0 under the null: at 300 per cell, random labels give ~0.07 from sampling alone.
+    Interpret against that, not against 0.
+    """
+    q = df.drop_duplicates("qid")
+    a = q[q.knowledge == "known"].relation.value_counts(normalize=True)
+    b = q[q.knowledge == "unknown"].relation.value_counts(normalize=True)
+    return float(a.sub(b, fill_value=0).abs().sum() / 2)
+
+
+def _match_by_relation(q: pd.DataFrame) -> pd.DataFrame:
+    """Choose the questions so `known` and `unknown` have the SAME relation mix.
+
+    Per relation take min(n_known, n_unknown) of each side, then scale every relation
+    down by a common factor so the total lands at TARGET_CELL_SIZE per side. Scaling by
+    a common factor rather than truncating relation-by-relation is what keeps the mix
+    matched; taking a fixed number per relation would flatten it into a uniform mix
+    that no longer resembles the pool.
+
+    Matching is done ONCE over questions, not independently per cell. A question's two
+    instances go to two different cells (factual -> agreement or correction,
+    counterfactual -> resistance or both_wrong), so matching the question set matches
+    all four cells at once and leaves the two instances of a question paired, which
+    paired_bootstrap requires.
+    """
+    caps = {}
+    for rel, grp in q.groupby("relation"):
+        caps[rel] = min(int((grp.knowledge == "known").sum()),
+                        int((grp.knowledge == "unknown").sum()))
+    capacity = sum(caps.values())
+    if capacity == 0:
+        return q.iloc[0:0]
+    scale = min(1.0, TARGET_CELL_SIZE / capacity)
+
+    picked = []
+    for rel, cap in caps.items():
+        take = int(round(cap * scale))
+        if take == 0:
+            continue
+        grp = q[q.relation == rel]
+        for k in ("known", "unknown"):
+            side = grp[grp.knowledge == k]
+            picked.append(side.sample(min(take, len(side)), random_state=SEED % 2**31))
+    return pd.concat(picked, ignore_index=True) if picked else q.iloc[0:0]
+
+
 def phase_cells():
     df = _merged()
     df = df[df.knowledge != "discard"]
-    rows = []
-    for r in df.itertuples():
-        for kind in ("factual", "counterfactual"):
-            rows.append({
-                "qid": r.qid, "subject_qid": r.subject_qid, "question": r.question,
-                "context_kind": kind,
-                "context": (r.factual_context if kind == "factual"
-                            else r.counterfactual_context),
-                "cell": CELLS[(r.knowledge, kind)],
-                "knowledge": r.knowledge,
-                "entropy": r.entropy, "max_prob": r.max_prob,
-                # TARGET IS ALWAYS THE FACTUAL GOLD. In the resistance cell the document
-                # is wrong, so following it is the error. This is not a bug.
-                "target_aliases": r.gold_aliases,
-            })
-    out = pd.DataFrame(rows)
-    print("natural cell distribution:\n", out.cell.value_counts(), "\n")
+    if "relation" not in df.columns:
+        # pool.jsonl predates filter 5, or a test harness built it by hand. One bucket
+        # means matching is a no-op rather than an error.
+        df = df.assign(relation="?")
 
-    balanced = []
-    for cell, grp in out.groupby("cell"):
+    def explode(questions: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for r in questions.itertuples():
+            for kind in ("factual", "counterfactual"):
+                rows.append({
+                    "qid": r.qid, "subject_qid": r.subject_qid, "question": r.question,
+                    "relation": r.relation,
+                    "context_kind": kind,
+                    "context": (r.factual_context if kind == "factual"
+                                else r.counterfactual_context),
+                    "cell": CELLS[(r.knowledge, kind)],
+                    "knowledge": r.knowledge,
+                    "entropy": r.entropy, "max_prob": r.max_prob,
+                    # TARGET IS ALWAYS THE FACTUAL GOLD. In the resistance cell the
+                    # document is wrong, so following it is the error. Not a bug.
+                    "target_aliases": r.gold_aliases,
+                })
+        return pd.DataFrame(rows)
+
+    natural = explode(df)
+    print("natural cell distribution:\n", natural.cell.value_counts(), "\n")
+
+    # ---- UNMATCHED: the pre-registered secondary run, written for the sensitivity check
+    unmatched = []
+    for cell, grp in natural.groupby("cell"):
         take = min(TARGET_CELL_SIZE, len(grp))
-        balanced.append(grp.sample(take, random_state=SEED % 2**31))
+        unmatched.append(grp.sample(take, random_state=SEED % 2**31))
         if take < TARGET_CELL_SIZE:
-            print(f"  WARNING: cell '{cell}' has {take} (target {TARGET_CELL_SIZE})")
-    out = pd.concat(balanced, ignore_index=True)
+            print(f"  WARNING: unmatched cell '{cell}' has {take} "
+                  f"(target {TARGET_CELL_SIZE})")
+    unmatched = pd.concat(unmatched, ignore_index=True)
+    _write_cells("cells_unmatched.jsonl", unmatched, matched=False)
 
-    with open(_path("cells.jsonl"), "w") as f:
+    # ---- MATCHED: the primary run ------------------------------------------------------
+    q = df.drop_duplicates("qid")
+    caps = {rel: min(int((g.knowledge == "known").sum()),
+                     int((g.knowledge == "unknown").sum()))
+            for rel, g in q.groupby("relation")}
+    print(f"relation-matched capacity: {sum(caps.values())} per side "
+          f"(target {TARGET_CELL_SIZE})")
+    out = explode(_match_by_relation(q))
+    for cell, grp in out.groupby("cell"):
+        if len(grp) < TARGET_CELL_SIZE:
+            print(f"  WARNING: matched cell '{cell}' has {len(grp)} "
+                  f"(target {TARGET_CELL_SIZE})")
+    _write_cells("cells.jsonl", out, matched=True)
+    print("\nRe-run `python gate1.py sanity` to see the per-cell relation mix and both\n"
+          "TVDs. The secondary run is `python gate1.py decode|sweep|analyze --unmatched`.")
+
+
+def _write_cells(name: str, out: pd.DataFrame, matched: bool):
+    tvd = relation_mix_tvd(out)
+    meta = {
+        "_meta": True,
+        "matched": matched,
+        "n_instances": int(len(out)),
+        "n_questions": int(out.qid.nunique()),
+        "cell_sizes": {k: int(v) for k, v in out.cell.value_counts().items()},
+        "relation_mix_tvd": tvd,
+        "relation_mix": {
+            cell: {k: int(v) for k, v in
+                   grp.relation.value_counts().items()}
+            for cell, grp in out.groupby("cell")
+        },
+    }
+    with open(_path(name), "w") as f:
+        f.write(json.dumps(meta) + "\n")
         for r in out.to_dict("records"):
             f.write(json.dumps(r) + "\n")
-    print(f"\nwrote {len(out)} instances")
+    print(f"wrote {name}: {len(out)} instances, relation-mix TVD {tvd:.3f}"
+          f"{' (matched)' if matched else ' (UNMATCHED secondary run)'}")
 
 
 # ======================================================================================
@@ -381,7 +539,7 @@ def greedy_decode(question: str, context: str, tau: float, max_tokens: int = 32)
 
 
 def phase_decode():
-    cells = pd.DataFrame(read_jsonl("cells.jsonl"))
+    cells = pd.DataFrame(read_jsonl(CELLS_FILE))
     cfgs = build_configs(cells)
     work = sorted(required_work(cells, cfgs))
     taus = sorted({w[2] for w in work})
@@ -411,7 +569,7 @@ def phase_decode():
 
 def phase_sweep():
     """CPU only. Scores every config against the cached generations."""
-    cells = pd.DataFrame(read_jsonl("cells.jsonl"))
+    cells = pd.DataFrame(read_jsonl(CELLS_FILE))
     gens = {(g["qid"], g["context_kind"], g["tau"]): g
             for g in read_jsonl("generations.jsonl")}
     cfgs = build_configs(cells)
@@ -427,12 +585,12 @@ def phase_sweep():
                          "correct": alias_match(g["text"], r["target_aliases"]),
                          "n_chars": g["n_chars"]})
     df = pd.DataFrame(recs)
-    df.to_csv(_path("sweep.csv"), index=False)
+    df.to_csv(_path(SWEEP_FILE), index=False)
 
     # PROTOCOL 4.3: degenerate generation check
     print("mean output length by tau0 (collapse => sweep invalid at that end):")
     print(df.groupby("tau0").n_chars.mean().round(1))
-    print(f"\nwrote {_path('sweep.csv')} ({len(df)} rows)")
+    print(f"\nwrote {_path(SWEEP_FILE)} ({len(df)} rows)")
 
 
 # ======================================================================================
@@ -476,7 +634,7 @@ def paired_bootstrap(a: pd.DataFrame, b: pd.DataFrame, n_boot: int = N_BOOT):
 
 
 def phase_analyze():
-    sweep = pd.read_csv(_path("sweep.csv"))
+    sweep = pd.read_csv(_path(SWEEP_FILE))
     off = json.load(open(_path("sanity.json")))["off_diagonal"]
     pts = {a: best_operating_point(sweep, a) for a in ARMS if a in set(sweep.arm)}
 
@@ -525,7 +683,11 @@ PHASES = {"pool": phase_pool, "labels": phase_labels, "parity": phase_parity,
           "sweep": phase_sweep, "analyze": phase_analyze}
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in PHASES:
+    args = [a for a in sys.argv[1:] if a != "--unmatched"]
+    if "--unmatched" in sys.argv:
+        CELLS_FILE, SWEEP_FILE = "cells_unmatched.jsonl", "sweep_unmatched.csv"
+        print(f"SECONDARY RUN: {CELLS_FILE} -> {SWEEP_FILE}\n")
+    if not args or args[0] not in PHASES:
         print(__doc__)
         sys.exit(1)
-    PHASES[sys.argv[1]](*sys.argv[2:])
+    PHASES[args[0]](*args[1:])

@@ -96,6 +96,27 @@ source of noise you would otherwise own.
 - the two contexts differ in more than the target entity
 - `subject_qid` is missing (you need it for deduplication later)
 
+*Post-hoc filters, added after the checkpoints that motivated them. Flagged as post-hoc
+in `attrition.json` and in the writeup; they are not part of the original three.*
+
+- **4** (after the Phase 1 read): the other condition's answer survives in the passage,
+  in either direction.
+- **5** (after the Phase 2 label read): the relation is not FUNCTIONAL. One-to-many
+  predicates — `award received`, `genre`, `member of`, `field of work` — have several
+  true objects and ConFiQA picked one, so "does the model know this fact" is not
+  well-posed, the same argument 1.1 uses to exclude MR/MC. Measured: one-to-many rows
+  are labelled `unknown` 63% of the time against 34% for functional ones, with an
+  identical majority-class share (24%). Temporal predicates (`head of state`,
+  `chief executive officer`) are excluded and **tagged, not discarded** — they are the
+  legitimate-update case for a possible Gate 2. Four relations are dropped as
+  structurally broken in ConFiQA: `follows` (54% name the answer in the question),
+  `country` (43% tautologous), `location`, `capital of`.
+- **6** (one global rule): a normalized gold alias appears in the question text, so the
+  question contains its own answer. Uses the same matcher as labels and scoring.
+
+  **Scoping cost:** the surviving pool is functional person-and-work facts, 1793 rows.
+  Results do not generalise to set-valued relations. `spouse` alone is 23% of it.
+
 **1.4** Record pool size after each filter. Report the attrition chain.
 
 ---
@@ -166,7 +187,37 @@ Cross the knowledge label with the document condition. Each question yields two 
 the document is wrong, so following it is the error. This is the cell that does not exist
 on NQ-SWAP, and it is the reason this slice is being built.
 
-**3.3** Balance to ~300 per cell by subsampling. Report the natural distribution first.
+**3.3 — Balance to ~300 per cell by subsampling. Report the natural distribution first.**
+
+*Amended after the Phase 2 label read (2026-08-04). Two runs are now pre-registered.*
+
+**PRIMARY — matched.** Subsample so the `known` and `unknown` question sets have the
+**same relation mix**: per relation take `min(n_known, n_unknown)` of each side, then
+scale every relation by a common factor to land at 300 per side. Matching is done once
+over questions, not per cell — a question's two instances go to two different cells, so
+matching the question set matches all four cells at once and keeps the pair intact for
+`paired_bootstrap`.
+
+Why: measured on the 1793-row functional pool, the relation mixes of the correction cell
+(drawn from `unknown`) and the resistance cell (drawn from `known`) differ at
+TVD **0.407** against a permutation null of 0.068, p < 0.0005. `composer` supplies 6% of
+resistance and 21% of correction; `country of citizenship` 15% and 5%. Left uncorrected,
+an oracle advantage in one cell and not the other could be a relation effect wearing a
+knowledge effect's clothes. Restricting to large-answer-space relations does **not** fix
+it (TVD 0.330, still p < 0.0005) and costs 44% of the pool, so the mix is matched
+directly instead. Matched capacity is 476 per side against the 300 target.
+
+**SECONDARY — unmatched.** The pre-amendment design: a uniform 300 per cell, written to
+`cells_unmatched.jsonl` and run with `--unmatched`. `generations.jsonl` is keyed by
+`(qid, context_kind, tau)`, so the secondary run reuses decode work wherever the two
+question sets overlap.
+
+**If the two runs give different verdicts, that difference is itself a finding** and must
+be reported, not resolved by picking one. The matched run is the headline.
+
+`cells.jsonl` and `cells_unmatched.jsonl` each carry a leading `_meta` row recording the
+realised per-cell relation mix and TVD. `phase_sanity` prints both, and warns if the
+matched TVD exceeds the ~0.07 sampling null — which would mean the match did not take.
 
 **3.4** Hold `both-wrong` out of the headline metric — neither source helps there, so it
 measures noise. Report separately.
