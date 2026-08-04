@@ -152,21 +152,47 @@ def phase_sample():
 def phase_build():
     pool = {r["qid"]: r for r in gate1.read_jsonl("pool.jsonl")}
     rel = relations(list(pool.values()))
+    # pairs_raw.jsonl also holds the 100 rows reused from instrument.jsonl, which were
+    # drawn pool-wide. Restrict to eligible relations here too, or a relation like
+    # `country of citizenship` (2% high-risk) contributes a pair and reintroduces the
+    # confound matching exists to remove.
+    elig = eligible(list(pool.values()), rel)
+    plan = allocate(elig)
+
     done = [r for r in gate1.read_jsonl("pairs_raw.jsonl") if r["knowledge"] == "unknown"]
     by_rel = defaultdict(lambda: {"high": [], "low": []})
+    dropped = defaultdict(int)
     for r in done:
         src = pool.get(r["qid"])
-        if src:
-            by_rel[rel[r["qid"]]]["high" if is_high_risk(src) else "low"].append(r)
+        if not src:
+            continue
+        k = rel[r["qid"]]
+        if k not in elig:
+            dropped[k] += 1
+            continue
+        by_rel[k]["high" if is_high_risk(src) else "low"].append(r)
+    if dropped:
+        print("ignored (relation not eligible): "
+              + ", ".join(f"{k} {n}" for k, n in sorted(dropped.items(), key=lambda x: -x[1])[:6]))
 
     rng = random.Random(gate1.SEED)
-    pairs = []
+    avail = {}
     for k, v in sorted(by_rel.items()):
         rng.shuffle(v["high"])
         rng.shuffle(v["low"])
-        n = min(len(v["high"]), len(v["low"]))
-        for i in range(n):
-            pairs.append({"relation": k, "high": v["high"][i], "low": v["low"][i]})
+        avail[k] = [{"relation": k, "high": v["high"][i], "low": v["low"][i]}
+                    for i in range(min(len(v["high"]), len(v["low"])))]
+
+    # Honour the per-relation plan first, so the set spreads across relations rather
+    # than piling onto whichever relation happened to get extra candidates. Only then
+    # top up from relations with spare pairs.
+    pairs, spare = [], []
+    for k, lst in avail.items():
+        want = plan.get(k, 0)
+        pairs += lst[:want]
+        spare += lst[want:]
+    rng.shuffle(spare)
+    pairs += spare[:max(0, TARGET_PAIRS - len(pairs))]
     rng.shuffle(pairs)
     pairs = pairs[:TARGET_PAIRS]
 
