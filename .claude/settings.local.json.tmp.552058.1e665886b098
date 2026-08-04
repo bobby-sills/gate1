@@ -25,7 +25,11 @@
       "Bash(PYTHONHASHSEED=0 nix-shell -p \"python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)\" --run \"python /tmp/claude-1000/-home-bobby-Coding-proposal-test/2d0659af-236e-4f25-bda3-d4fa9e3b6dc1/scratchpad/test_cache.py\")",
       "Bash(PYTHONHASHSEED=0 nix-shell -p \"python3.withPackages\\(ps: [ps.torch ps.transformers ps.numpy ps.pandas]\\)\" --run \"python /tmp/claude-1000/-home-bobby-Coding-proposal-test/2d0659af-236e-4f25-bda3-d4fa9e3b6dc1/scratchpad/test_real.py\")",
       "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: next_token_distributions + is_eos + detokenize \\(Task 4\\) *)",
-      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: split tokenizer loading out of _load *)"
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'backend: split tokenizer loading out of _load *)",
+      "Bash(gh auth *)",
+      "Bash(GATE1_OUT=./outputs nix-shell -p \"python3.withPackages\\(ps: [ps.numpy ps.pandas]\\)\" --run \"python instrument.py --report\")",
+      "Bash(rm -f outputs/instrument.jsonl outputs/instrument.json outputs/pool100_stratified.jsonl outputs/pool100_strata.json)",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m 'add cache tests and stratified instrumentation script *)"
     ]
   }
 }
