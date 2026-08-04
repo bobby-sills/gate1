@@ -491,7 +491,10 @@ def render_prompts(question: str, context: str) -> tuple[str, str]:
     strings to outputs/prompt_parity.txt for 10 instances and tell the human to read
     them. Whitespace-insensitive diffs hide exactly the failure this check exists for.
     """
-    raise NotImplementedError
+    # Same builder as sections 2 and 4 -- these ARE the prompts those passes run, not a
+    # reconstruction of them. No assertion here on purpose: gate1.phase_parity writes
+    # both strings out and stops, and a human reads them.
+    return _build_prompt(question, None), _build_prompt(question, context)
 
 
 # ======================================================================================
