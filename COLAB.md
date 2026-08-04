@@ -49,15 +49,36 @@ If that prints an empty value, stop and fix it before running any phase.
 
 ## Cell 3 — code and dependencies
 
+The repo is **private**, so the clone needs a token. Use a fine-grained PAT with read
+access to `bobby-sills/gate1`, and rewrite the remote afterwards so the token is not left
+sitting in `.git/config`:
+
 ```python
-!git clone https://github.com/<you>/gate1.git /content/gate1   # or upload the files
+from getpass import getpass
+tok = getpass('GitHub PAT: ')
+!git clone https://{tok}@github.com/bobby-sills/gate1.git /content/gate1
+!cd /content/gate1 && git remote set-url origin https://github.com/bobby-sills/gate1.git
 %cd /content/gate1
 !pip -q install transformers accelerate pandas numpy
 !python selftest.py 2>&1 | tail -5
 ```
 
+`data/` and `outputs/` are gitignored and not in the repo. Neither needs transferring:
+cell 5 clones ConFiQA directly, and `gate1.py pool` is deterministic, so `pool.jsonl`
+regenerates identically here.
+
 `selftest.py` must print `SELFTEST PASSED` before you write any backend code. It runs the
 whole pipeline against a fake backend, including a simulated disconnect and resume.
+
+Two further tests cover `next_token_distributions`, which `selftest.py` cannot reach
+because it monkeypatches `greedy_decode`. Worth running once after any change to the KV
+cache -- they caught a stale-cache bug that produced wrong log-probs silently, on the
+second and every later tau of each instance:
+
+```python
+!python test_cache.py 2>&1 | tail -3    # fake cache, asserts backend's past_len bookkeeping
+!python test_real.py  2>&1 | tail -3    # real DynamicCache, tiny random Llama, CPU, no download
+```
 
 ---
 
@@ -92,6 +113,7 @@ All phases are ordinary Python invocations from a `!` cell:
 
 ```python
 !python gate1.py pool data/ConFiQA-QA.json data/FiQA.json
+!python instrument.py                   # CHECKPOINT -- timing + the alias measurement
 !python gate1.py labels
 !python gate1.py parity
 !python gate1.py sanity
@@ -103,6 +125,22 @@ All phases are ordinary Python invocations from a `!` cell:
 
 Run them in **separate cells**, not one block. `labels` and `decode` are the long ones and
 you want to be able to re-issue just those.
+
+`pool` takes a second path argument for FiQA. **There is no FiQA file** -- Context-DPO
+ships only ConFiQA-{QA,MR,MC}.json, and the factual context is `orig_context` on the same
+ConFiQA row. The argument is accepted so this command line keeps working and is otherwise
+unused; `load_pool` prints a notice saying no join happened. Pass anything.
+
+`instrument.py` replaces the "swap in a 100-row pool.jsonl" recipe in HANDOFF Task 2.
+`gate1.phase_labels` computes its generations at line 187 and discards them -- only
+n_correct/knowledge/entropy/max_prob reach `labels.jsonl` -- so the swap gives timing but
+cannot measure how often the model produces a short form that `alias_match` rejects.
+`instrument.py` calls the same two backend functions in the same order, on a stratified
+50 high-risk / 50 rest sample, and keeps the generations. Re-print its report on CPU any
+time with `!python instrument.py --report`.
+
+`parity` no longer needs a GPU: rendering prompts uses the chat template, not the
+weights. You can do the Phase 2.7 human read in a CPU session.
 
 ---
 
@@ -139,8 +177,9 @@ three, and the analysis phases are CPU-only and take minutes.
 | Phase | GPU | Estimate |
 |---|---|---|
 | `pool` | no | minutes |
+| `instrument.py` | yes | 100 instances — measures the rest of this table |
 | `labels` | yes | 20–40 min |
-| `parity` | yes | seconds |
+| `parity` | no | seconds (tokenizer only) |
 | `sanity` | no | seconds |
 | `cells` | no | seconds |
 | `decode` | yes | 1.5–3 hr |
