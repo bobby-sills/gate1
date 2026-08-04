@@ -363,11 +363,24 @@ def _match_by_relation(q: pd.DataFrame) -> pd.DataFrame:
     capacity = sum(caps.values())
     if capacity == 0:
         return q.iloc[0:0]
-    scale = min(1.0, TARGET_CELL_SIZE / capacity)
+    target = min(TARGET_CELL_SIZE, capacity)
+    scale = target / capacity
+
+    # Largest-remainder apportionment. Plain rounding loses a few instances to rounding
+    # error and reports a cell-size shortfall that is not one; hand the remainder to the
+    # relations with the largest fractional parts so the total is exactly `target`.
+    exact = {rel: cap * scale for rel, cap in caps.items()}
+    take_by_rel = {rel: min(int(v), caps[rel]) for rel, v in exact.items()}
+    short = target - sum(take_by_rel.values())
+    for rel, _ in sorted(exact.items(), key=lambda x: -(x[1] - int(x[1]))):
+        if short <= 0:
+            break
+        if take_by_rel[rel] < caps[rel]:
+            take_by_rel[rel] += 1
+            short -= 1
 
     picked = []
-    for rel, cap in caps.items():
-        take = int(round(cap * scale))
+    for rel, take in take_by_rel.items():
         if take == 0:
             continue
         grp = q[q.relation == rel]
