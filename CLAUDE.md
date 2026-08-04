@@ -8,14 +8,20 @@ changing anything.
 
 | File | Who edits | Notes |
 |---|---|---|
-| `backend.py` | **You** | The only file to edit. Four stubs. |
-| `gate1.py` | Nobody | Runner, cache, gate, statistics. Do not edit. |
-| `PROTOCOL.md` | Nobody | Experiment design and rationale. |
+| `backend.py` | **You** | Edit freely. Four stubs, plus the pool filters. |
+| `gate1.py` | You, **on authorization** | Runner, cache, gate, statistics. |
+| `PROTOCOL.md` | You, **on authorization** | Experiment design and rationale. |
+| `HANDOFF.md` | You, **on authorization** | Sequenced tasks. |
+| `CLAUDE.md` | You, **on authorization** | This file. |
 | `selftest.py` | Nobody | Run after each backend change. |
-| `CLAUDE.md` | Nobody | This file. |
 
-If a task seems to require editing `gate1.py`, **stop and ask the human**. It almost
-certainly means a `backend.py` signature was misread.
+**The rule that stays is ask-first.** For anything other than `backend.py`, say what you
+want to change and why, then wait. Do not infer authorization from a related approval —
+it is granted per change. It has been granted before (filters 5–6 and the
+relation-matched `phase_cells`, 2026-08-04), and every time it fired it caught something.
+
+If a task *seems* to require editing `gate1.py`, the first hypothesis is still that a
+`backend.py` signature was misread. Check that before asking.
 
 ## What this experiment is
 
