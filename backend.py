@@ -13,7 +13,14 @@ Implement in this order, committing after each:
     4. next_token_distributions
 """
 
+import ast
+import difflib
+import hashlib
+import json
+import sys
 from dataclasses import dataclass
+
+import gate1
 
 
 # ======================================================================================
@@ -30,6 +37,98 @@ class RawInstance:
     cf_aliases: list[str]          # counterfactual answer + aliases, non-empty
     factual_context: str           # passage supporting the factual answer (FiQA)
     counterfactual_context: str    # passage supporting the counterfactual (ConFiQA)
+
+
+# --------------------------------------------------------------------------------------
+# Loader notes -- read these before changing anything here.
+#
+# NO FiQA FILE EXISTS. github.com/byronBBL/Context-DPO ships only ConFiQA-{QA,MR,MC}.json.
+# There is no separate factual-context dataset to join against. ConFiQA rows carry BOTH
+# conditions natively (orig_context / cf_context), which is what PROTOCOL 1.2 means by
+# "the document-correctness axis is inherited rather than constructed". So there is no
+# join step: factual_context comes from orig_context of the same row. `fiqa_path` is
+# accepted to keep the signature and the documented command line intact, and is otherwise
+# unused; the loader says so loudly so nobody believes a join happened.
+#
+# NO question id EXISTS EITHER. `qid` is synthesized as a hash of
+# (question, orig_triple, cf_triple). It is deterministic across runs and processes,
+# which resume in `labels` and `decode` depends on.
+#
+# DOCUMENT = full context, not context_piece. orig_context / cf_context are the
+# multi-sentence paragraphs (~518 chars mean), matching Context-DPO's own evaluation
+# setting. Known cost: some cf_context paragraphs still mention the factual answer
+# elsewhere in the passage, which makes the resistance cell easier for every arm alike.
+# Reported by load_pool as `cf_context_mentions_gold` -- a data property, not a filter.
+# --------------------------------------------------------------------------------------
+
+QID_LEN = 16
+
+
+def _aliases(row: dict, which: str) -> list[str]:
+    """Answer plus its alias list. ConFiQA leaves `*_alias` empty for ~21% of rows, so
+    the answer string itself must always lead the list."""
+    raw = [row.get(f"{which}_answer")] + list(row.get(f"{which}_alias") or [])
+    seen, out = set(), []
+    for a in raw:
+        if isinstance(a, str) and a.strip() and a not in seen:
+            seen.add(a)
+            out.append(a.strip())
+    return out
+
+
+def _subject_qid(row: dict) -> str:
+    """First element of orig_triple, e.g. "('Q29021224', 'P86', 'Q608628')" -> Q29021224."""
+    try:
+        triple = ast.literal_eval(row["orig_triple"])
+    except (ValueError, SyntaxError, KeyError, TypeError):
+        return ""
+    if not isinstance(triple, (list, tuple)) or not triple:
+        return ""
+    subj = str(triple[0]).strip()
+    return subj if subj.startswith("Q") and subj[1:].isdigit() else ""
+
+
+def _make_qid(row: dict) -> str:
+    payload = "||".join(str(row.get(k, "")) for k in ("question", "orig_triple", "cf_triple"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:QID_LEN]
+
+
+def _alias_collision(gold: list[str], cf: list[str]) -> bool:
+    """Filter 2. Substring in EITHER direction after gate1.normalize, not equality.
+
+    The matcher used for labels (Phase 2) and scoring (Phase 5) is substring-based, so a
+    cf alias that merely *contains* or is *contained in* a gold alias -- "America" vs
+    "United States of America" -- makes alias_match fire on the wrong answer and silently
+    scores a resistance failure as a success. The filter has to be exactly as loose as the
+    matcher or invariant #3 does not hold.
+    """
+    g = {gate1.normalize(a) for a in gold}
+    c = {gate1.normalize(a) for a in cf}
+    g.discard("")
+    c.discard("")
+    return any(x in y or y in x for x in g for y in c)
+
+
+def _context_diff_is_entity_only(orig_ctx: str, cf_ctx: str,
+                                 gold: list[str], cf: list[str]) -> bool:
+    """Filter 3. The two passages must differ ONLY where the target entity was swapped.
+
+    Whitespace-token diff; every non-equal span must read as the gold answer on the
+    factual side and as the counterfactual answer on the counterfactual side. Anything
+    else means the generator rewrote more than the entity, and the document-correctness
+    axis is no longer the only thing that changed between the two conditions.
+
+    Strict on purpose. It costs rows where the entity is welded into a compound
+    ("States-based" / "Kingdom-based"), and it catches genuinely broken rows -- one cf
+    passage in ConFiQA-QA degenerates into "African-American" repeated ~200 times.
+    """
+    a, b = orig_ctx.split(), cf_ctx.split()
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    spans = [(" ".join(a[i1:i2]), " ".join(b[j1:j2]))
+             for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal"]
+    if not spans:
+        return False          # identical passages: no counterfactual at all
+    return all(gate1.alias_match(o, gold) and gate1.alias_match(n, cf) for o, n in spans)
 
 
 def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], dict]:
@@ -57,7 +156,85 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
     VERIFY BEFORE MOVING ON: print the attrition chain and 3 full instances. A human
     reads them. Do not proceed on a silent pass.
     """
-    raise NotImplementedError
+    if "confiqa" not in confiqa_qa_path.lower():
+        print(f"NOTE: {confiqa_qa_path} does not look like a ConFiQA file.", file=sys.stderr)
+    if "mr" in confiqa_qa_path.lower().replace("confiqa", "") or \
+       "mc" in confiqa_qa_path.lower().replace("confiqa", ""):
+        raise ValueError(f"{confiqa_qa_path} looks like the MR or MC subset. "
+                         "PROTOCOL 1.1: QA subset only -- MR and MC are multi-hop and "
+                         "the knowledge premise does not hold there.")
+
+    print("=" * 78, file=sys.stderr)
+    print("NO JOIN WAS PERFORMED. Context-DPO ships no FiQA file; ConFiQA-QA rows carry "
+          "both\nconditions natively, so factual_context comes from `orig_context` of the "
+          f"same row.\n`fiqa_path`={fiqa_path!r} is unused.", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+
+    with open(confiqa_qa_path) as f:
+        rows = json.load(f)
+
+    attrition = {
+        "loaded": len(rows),
+        "fiqa_join": "not performed -- no FiQA file exists in Context-DPO; "
+                     "factual_context taken from ConFiQA `orig_context`",
+        "document_field": "orig_context / cf_context (full passage, not context_piece)",
+    }
+
+    # ---- filter 1: subject_qid present (plus basic well-formedness) -------------------
+    stage1, drop_no_qid, drop_malformed = [], 0, 0
+    for r in rows:
+        subj = _subject_qid(r)
+        if not subj:
+            drop_no_qid += 1
+            continue
+        gold, cf = _aliases(r, "orig"), _aliases(r, "cf")
+        if not (r.get("question") and gold and cf
+                and r.get("orig_context") and r.get("cf_context")):
+            drop_malformed += 1
+            continue
+        stage1.append((r, subj, gold, cf))
+    attrition["dropped_missing_subject_qid"] = drop_no_qid
+    attrition["dropped_malformed"] = drop_malformed
+    attrition["after_filter_1"] = len(stage1)
+
+    # ---- filter 2: gold/counterfactual alias collision --------------------------------
+    stage2 = [t for t in stage1 if not _alias_collision(t[2], t[3])]
+    attrition["dropped_alias_collision"] = len(stage1) - len(stage2)
+    attrition["after_filter_2"] = len(stage2)
+
+    # ---- filter 3: contexts differ only by the target entity --------------------------
+    stage3 = [t for t in stage2
+              if _context_diff_is_entity_only(t[0]["orig_context"], t[0]["cf_context"],
+                                              t[2], t[3])]
+    attrition["dropped_context_diff"] = len(stage2) - len(stage3)
+    attrition["after_filter_3"] = len(stage3)
+
+    # ---- build, dropping any qid hash collision ---------------------------------------
+    instances, seen = [], set()
+    dup = 0
+    for r, subj, gold, cf in stage3:
+        qid = _make_qid(r)
+        if qid in seen:
+            dup += 1
+            continue
+        seen.add(qid)
+        instances.append(RawInstance(
+            qid=qid,
+            subject_qid=subj,
+            question=r["question"].strip(),
+            gold_aliases=gold,
+            cf_aliases=cf,
+            factual_context=r["orig_context"].strip(),
+            counterfactual_context=r["cf_context"].strip(),
+        ))
+    attrition["dropped_duplicate_qid"] = dup
+    attrition["final"] = len(instances)
+
+    # ---- reported properties, not filters ---------------------------------------------
+    attrition["unique_subject_qids"] = len({i.subject_qid for i in instances})
+    attrition["cf_context_mentions_gold"] = sum(
+        gate1.alias_match(i.counterfactual_context, i.gold_aliases) for i in instances)
+    return instances, attrition
 
 
 # ======================================================================================
