@@ -66,6 +66,11 @@ class RawInstance:
 
 QID_LEN = 16
 
+# Minimum NORMALIZED length for an alias to be kept. Measured after gate1.normalize,
+# not on the raw string: "U.S." is 4 raw characters but normalizes to "us", and it is
+# the normalized form that gate1.alias_match substring-tests. See _clean_aliases.
+MIN_ALIAS_CHARS = 3
+
 
 def _aliases(row: dict, which: str) -> list[str]:
     """Answer plus its alias list. ConFiQA leaves `*_alias` empty for ~21% of rows, so
@@ -77,6 +82,29 @@ def _aliases(row: dict, which: str) -> list[str]:
             seen.add(a)
             out.append(a.strip())
     return out
+
+
+def _clean_aliases(aliases: list[str]) -> list[str]:
+    """Drop alias entries that make gate1.alias_match fire on arbitrary text.
+
+    alias_match tests `normalize(alias) in normalize(prediction)`, so two classes of
+    entry shipped by ConFiQA are pathological:
+
+      A. entries that normalize to "" -- emoji flags and currency symbols ('🇯🇵', '£',
+         '$', '⚾'). `"" in anything` is True, so a single such alias makes EVERY
+         generation score correct: n_correct=10, label `known` regardless of the model,
+         and accuracy 1.0 in every cell for every arm. 165 rows in the pool.
+      B. very short entries -- 'US', 'fr', 'ru', 'ja', 'or' (Odia), 'SS'. These are
+         substrings of ordinary English prose. 294 rows.
+
+    Together they scored a non-answer as correct in 10.3% of the pool.
+
+    The primary answer (index 0) is never dropped, so the list stays non-empty. Rows
+    whose primary answer is itself degenerate are removed by filter 1 instead -- an
+    unscoreable answer is unusable in either direction, not repairable by keeping it.
+    """
+    return [aliases[0]] + [a for a in aliases[1:]
+                           if len(gate1.normalize(a)) >= MIN_ALIAS_CHARS]
 
 
 def _subject_qid(row: dict) -> str:
@@ -134,6 +162,24 @@ def _context_diff_is_entity_only(orig_ctx: str, cf_ctx: str,
     return all(gate1.alias_match(o, gold) and gate1.alias_match(n, cf) for o, n in spans)
 
 
+def _answer_leaks(context: str, aliases: list[str]) -> bool:
+    """Filter 4. Does this passage contain a complete alias of the OTHER condition's
+    answer, i.e. can a model score correct by copying the document it should be
+    resisting (or contradicting the document it should be following)?
+
+    POST-HOC FILTER -- not one of the three in the docstring above. Added after the
+    Phase 1 checkpoint, on evidence: ConFiQA swapped only the full-name mention when it
+    built the counterfactual, so passages routinely retain material supporting the other
+    answer. Symmetric by design: gold surviving in cf_context corrupts `resistance`,
+    cf surviving in factual_context corrupts `agreement`/`correction`.
+
+    Fragment survivals ("...Balfe's score" where gold is "Lorne Balfe") are NOT filtered.
+    alias_match cannot fire on them, so they cannot turn into a scored-correct answer.
+    Only complete-alias survivals are dropped.
+    """
+    return gate1.alias_match(context, aliases)
+
+
 def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], dict]:
     """Load ConFiQA-QA and FiQA, join on question id, filter.
 
@@ -184,7 +230,8 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
     }
 
     # ---- filter 1: subject_qid present (plus basic well-formedness) -------------------
-    stage1, drop_no_qid, drop_malformed = [], 0, 0
+    stage1, drop_no_qid, drop_malformed, drop_unscoreable = [], 0, 0, 0
+    n_alias_trimmed, n_aliases_dropped = 0, 0
     for r in rows:
         subj = _subject_qid(r)
         if not subj:
@@ -195,9 +242,22 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
                 and r.get("orig_context") and r.get("cf_context")):
             drop_malformed += 1
             continue
-        stage1.append((r, subj, gold, cf))
+        # An answer that normalizes to fewer than MIN_ALIAS_CHARS is unscoreable: it
+        # substring-matches arbitrary text, and keeping it would poison filters 2 and 4
+        # as well as Phase 2 labelling. It cannot be repaired by trimming aliases.
+        if min(len(gate1.normalize(gold[0])), len(gate1.normalize(cf[0]))) < MIN_ALIAS_CHARS:
+            drop_unscoreable += 1
+            continue
+        clean_gold, clean_cf = _clean_aliases(gold), _clean_aliases(cf)
+        n_aliases_dropped += (len(gold) - len(clean_gold)) + (len(cf) - len(clean_cf))
+        n_alias_trimmed += (len(clean_gold) < len(gold)) or (len(clean_cf) < len(cf))
+        stage1.append((r, subj, clean_gold, clean_cf))
     attrition["dropped_missing_subject_qid"] = drop_no_qid
     attrition["dropped_malformed"] = drop_malformed
+    attrition["dropped_unscoreable_answer"] = drop_unscoreable
+    attrition["alias_hygiene_min_normalized_chars"] = MIN_ALIAS_CHARS
+    attrition["rows_with_aliases_trimmed"] = n_alias_trimmed
+    attrition["alias_entries_dropped"] = n_aliases_dropped
     attrition["after_filter_1"] = len(stage1)
 
     # ---- filter 2: gold/counterfactual alias collision --------------------------------
@@ -212,10 +272,23 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
     attrition["dropped_context_diff"] = len(stage2) - len(stage3)
     attrition["after_filter_3"] = len(stage3)
 
+    # ---- filter 4 (POST-HOC): the other condition's answer survives in the passage ----
+    gold_in_cf = sum(1 for t in stage3 if _answer_leaks(t[0]["cf_context"], t[2]))
+    cf_in_factual = sum(1 for t in stage3 if _answer_leaks(t[0]["orig_context"], t[3]))
+    stage4 = [t for t in stage3
+              if not _answer_leaks(t[0]["cf_context"], t[2])
+              and not _answer_leaks(t[0]["orig_context"], t[3])]
+    attrition["filter_4_status"] = ("POST-HOC, added after the Phase 1 checkpoint -- "
+                                    "not one of the three pre-registered filters")
+    attrition["dropped_gold_alias_in_cf_context"] = gold_in_cf
+    attrition["dropped_cf_alias_in_factual_context"] = cf_in_factual
+    attrition["dropped_filter_4_total"] = len(stage3) - len(stage4)
+    attrition["after_filter_4"] = len(stage4)
+
     # ---- build, dropping any qid hash collision ---------------------------------------
     instances, seen = [], set()
     dup = 0
-    for r, subj, gold, cf in stage3:
+    for r, subj, gold, cf in stage4:
         qid = _make_qid(r)
         if qid in seen:
             dup += 1
@@ -235,8 +308,16 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
 
     # ---- reported properties, not filters ---------------------------------------------
     attrition["unique_subject_qids"] = len({i.subject_qid for i in instances})
-    attrition["cf_context_mentions_gold"] = sum(
-        gate1.alias_match(i.counterfactual_context, i.gold_aliases) for i in instances)
+    # Fragment survivals that filter 4 deliberately leaves in: a >=4-char word from a
+    # gold alias still present in cf_context ("...Balfe's score"). alias_match cannot
+    # fire on these, so they cannot become a scored-correct answer, but they do make the
+    # counterfactual passage internally inconsistent. Reported, not filtered.
+    frag = 0
+    for i in instances:
+        words = {w for a in i.gold_aliases for w in gate1.normalize(a).split() if len(w) >= 4}
+        if words & set(gate1.normalize(i.counterfactual_context).split()):
+            frag += 1
+    attrition["cf_context_retains_gold_fragment"] = frag
     return instances, attrition
 
 
