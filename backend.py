@@ -345,18 +345,29 @@ _MODEL = None
 _TOK = None
 
 
+def _load_tok():
+    """Tokenizer only. Keeps `parity` off the GPU: rendering prompts needs the chat
+    template, not 16GB of weights, so the human can do the Phase 2.7 read in a CPU
+    session."""
+    global _TOK
+    if _TOK is None:
+        from transformers import AutoTokenizer
+        _TOK = AutoTokenizer.from_pretrained(gate1.MODEL)
+    return _TOK
+
+
 def _load():
     """Lazy singleton. Imported at call time so `pool`, `sanity`, `cells`, `sweep` and
     `analyze` -- all CPU-only phases -- never touch torch."""
-    global _MODEL, _TOK
+    global _MODEL
     if _MODEL is not None:
         return _TOK, _MODEL
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
     name = gate1.MODEL                       # pre-registered in gate1.py, not tunable
-    _TOK = AutoTokenizer.from_pretrained(name)
+    _load_tok()
 
     kwargs = {"dtype": torch.bfloat16, "device_map": "auto"}
     if os.environ.get("GATE1_LOAD_8BIT") == "1":
@@ -383,7 +394,7 @@ def _build_prompt(question: str, context: str | None) -> str:
     context=None -> closed book. Otherwise the document block is prepended to the user
     turn and is the ONLY difference between the two renderings.
     """
-    tok, _ = _load()
+    tok = _load_tok()
     user = f"Question: {question}" if context is None else \
            f"Document:\n{context}\n\nQuestion: {question}"
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
