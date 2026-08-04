@@ -76,6 +76,58 @@ def self_answering(row: dict) -> bool:
     return gate1.alias_match(row["question"], row["gold_aliases"])
 
 
+def _table2_fallback(keep: list[dict], stats: list):
+    """There is no labels.jsonl. Show what the two partial label sets can and cannot say.
+
+    instrument.jsonl is 100 questions stratified 50 high-risk / 50 rest, so pool rates
+    need reweighting by the real stratum share and per-relation cells are single digits.
+    pairs_raw.jsonl is drawn only from relations with >=30% high-risk rows -- all of them
+    ONE_TO_MANY -- and oversamples the high-risk side, so it says nothing about the
+    surviving pool. Neither supports table 2; this block exists to make that concrete.
+    """
+    import instrument
+
+    inst = gate1.read_jsonl("instrument.jsonl")
+    print("\n" + "=" * 78)
+    print("TABLE 2 -- NOT AVAILABLE: no labels.jsonl under $GATE1_OUT")
+    print("=" * 78)
+    print(f"  instrument.jsonl : {len(inst)} questions (stratified 50/50, not a sample "
+          "of the pool)")
+    print(f"  pairs_raw.jsonl  : {len(gate1.read_jsonl('pairs_raw.jsonl'))} questions "
+          "(ONE_TO_MANY relations only, high-risk oversampled)")
+    if not inst:
+        return
+
+    space = {rel: ratio for rel, _, _, ratio, _ in stats}
+    keep_qids = {r["qid"] for r in keep}
+    rel_by_qid = {r["qid"]: r["relation"] for r in keep}
+    sub = [r for r in inst if r["qid"] in keep_qids]
+    print(f"\n  instrument rows falling in the surviving pool: {len(sub)}")
+    if not sub:
+        return
+
+    # Reweight the two strata back to their real shares before comparing.
+    share_hr = sum(instrument.is_high_risk(r) for r in keep) / len(keep)
+    print(f"  high-risk share of the surviving pool: {share_hr:.1%}\n")
+    print(f"  {'answer space':<18} {'n':>4} {'known':>7} {'unknown':>8} {'discard':>8}")
+    for name, lo, hi in (("large (>=0.60)", 0.60, 1.01), ("small (<0.60)", -1.0, 0.60)):
+        rows = [r for r in sub if lo <= space.get(rel_by_qid[r["qid"]], 0) < hi]
+        if not rows:
+            continue
+        parts = {}
+        for k in ("known", "unknown", "discard"):
+            acc = 0.0
+            for st, w in (("high_risk", share_hr), ("rest", 1 - share_hr)):
+                grp = [r for r in rows if r["stratum"] == st]
+                if grp:
+                    acc += w * sum(r["knowledge"] == k for r in grp) / len(grp)
+            parts[k] = acc
+        tot = sum(parts.values()) or 1.0
+        print(f"  {name:<18} {len(rows):>4} {parts['known']/tot:>6.0%} "
+              f"{parts['unknown']/tot:>7.0%} {parts['discard']/tot:>7.0%}")
+    print("\n  Cells are single digits. Directional at best; not a basis for a decision.")
+
+
 def main(confiqa_path: str):
     raw = json.load(open(confiqa_path))
     rel_by_qid = {backend._make_qid(r): relation_of(r) for r in raw}
@@ -131,7 +183,7 @@ def main(confiqa_path: str):
     # ---- TABLE 2: relation mix by cell -----------------------------------------------
     labels = gate1.read_jsonl("labels.jsonl")
     if not labels:
-        print("\n(no labels.jsonl under $GATE1_OUT -- skipping table 2)")
+        _table2_fallback(keep, stats)
         return
     know = {r["qid"]: r["knowledge"] for r in labels}
     print("\n" + "=" * 78)
