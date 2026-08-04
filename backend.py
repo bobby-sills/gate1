@@ -17,8 +17,11 @@ import ast
 import difflib
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
+
+import numpy as np
 
 import gate1
 
@@ -238,6 +241,92 @@ def load_pool(confiqa_qa_path: str, fiqa_path: str) -> tuple[list[RawInstance], 
 
 
 # ======================================================================================
+# MODEL PLUMBING  (shared by sections 2, 3 and 4)
+# ======================================================================================
+
+# The system prompt is IDENTICAL for both passes. The document is the only thing that
+# ever differs between them -- see render_prompts and the parity artifact.
+SYSTEM_PROMPT = ("You are a helpful assistant. Answer the question with the short "
+                 "factual answer only. Do not explain.")
+
+# Llama-3.1's chat template stamps "Today Date: <date>" into the system block, taking
+# the value from `date_string` (default: today). Left to default, the rendered prompt
+# changes between the `labels` run and the `decode` run, and again after midnight --
+# so cached generations would no longer correspond to the prompt that produced them.
+# Freezing it makes every pass reproducible. It is identical in both passes either way,
+# so parity is unaffected; this is about resumability, not about parity.
+DATE_STRING = "26 Jul 2024"          # the template's own default, pinned
+
+TEMPERATURE = 0.7                    # PROTOCOL 2.1
+MAX_NEW_TOKENS = 32                  # PROTOCOL 2.1
+
+_MODEL = None
+_TOK = None
+
+
+def _load():
+    """Lazy singleton. Imported at call time so `pool`, `sanity`, `cells`, `sweep` and
+    `analyze` -- all CPU-only phases -- never touch torch."""
+    global _MODEL, _TOK
+    if _MODEL is not None:
+        return _TOK, _MODEL
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    name = gate1.MODEL                       # pre-registered in gate1.py, not tunable
+    _TOK = AutoTokenizer.from_pretrained(name)
+
+    kwargs = {"dtype": torch.bfloat16, "device_map": "auto"}
+    if os.environ.get("GATE1_LOAD_8BIT") == "1":
+        # T4 fallback documented in COLAB.md. Slower, and the logits differ slightly
+        # from bf16 -- do not mix 8-bit and bf16 units within one experiment.
+        from transformers import BitsAndBytesConfig
+        kwargs = {"quantization_config": BitsAndBytesConfig(load_in_8bit=True),
+                  "device_map": "auto"}
+        print("GATE1_LOAD_8BIT=1: loading in 8-bit.", file=sys.stderr)
+    try:
+        _MODEL = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    except TypeError:                        # transformers < 4.56 spells it torch_dtype
+        kwargs["torch_dtype"] = kwargs.pop("dtype")
+        _MODEL = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    _MODEL.eval()
+    return _TOK, _MODEL
+
+
+def _build_prompt(question: str, context: str | None) -> str:
+    """THE single prompt builder. Every pass in this file goes through it, so the parity
+    artifact in section 3 describes what sections 2 and 4 actually ran -- a parity check
+    against a prompt nothing else uses would be worthless.
+
+    context=None -> closed book. Otherwise the document block is prepended to the user
+    turn and is the ONLY difference between the two renderings.
+    """
+    tok, _ = _load()
+    user = f"Question: {question}" if context is None else \
+           f"Document:\n{context}\n\nQuestion: {question}"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                   date_string=DATE_STRING)
+
+
+def _encode(prompt: str):
+    """apply_chat_template already emits <|begin_of_text|>; add_special_tokens=False
+    stops the tokenizer adding a second BOS."""
+    tok, model = _load()
+    ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids
+    return ids.to(model.device)
+
+
+def _question_seed(question: str, seed: int) -> int:
+    """Stable across processes. Python's hash() is salted per interpreter, so using it
+    here would silently break resume -- a re-run would draw different samples."""
+    h = hashlib.sha256(question.encode("utf-8")).hexdigest()[:8]
+    return (seed ^ int(h, 16)) % (2**31 - 1)
+
+
+# ======================================================================================
 # 2. GENERATION AND FEATURES
 # ======================================================================================
 
@@ -250,7 +339,28 @@ def sample_closed_book(question: str, n: int, seed: int) -> list[str]:
 
     Returns: n answer strings, prompt stripped.
     """
-    raise NotImplementedError
+    import torch
+
+    tok, model = _load()
+    ids = _encode(_build_prompt(question, None))          # None -> no document
+    torch.manual_seed(_question_seed(question, seed))
+
+    with torch.inference_mode():
+        out = model.generate(
+            ids,
+            do_sample=True,
+            temperature=TEMPERATURE,
+            # Llama-3.1 ships generation_config with temperature=0.6, top_p=0.9. Those
+            # would silently apply on top of the pre-registered temperature, so both
+            # filters are disabled explicitly: PROTOCOL 2.1 registers temperature only.
+            top_p=1.0,
+            top_k=0,
+            num_return_sequences=n,
+            max_new_tokens=MAX_NEW_TOKENS,
+            pad_token_id=tok.eos_token_id,
+        )
+    return [tok.decode(seq[ids.shape[1]:], skip_special_tokens=True).strip()
+            for seq in out]
 
 
 def deterministic_features(question: str) -> tuple[float, float]:
@@ -266,7 +376,19 @@ def deterministic_features(question: str) -> tuple[float, float]:
     baseline and inflates the headline result. This is the single most important
     instruction in this file.
     """
-    raise NotImplementedError
+    import torch
+
+    _, model = _load()
+    # Its own forward pass, on its own freshly-encoded prompt, with no cache shared with
+    # sample_closed_book and nothing carried over from it. Deliberately redundant compute.
+    ids = _encode(_build_prompt(question, None))
+    with torch.inference_mode():
+        logits = model(ids).logits[0, -1, :].float()      # first answer position
+
+    logp = torch.log_softmax(logits, dim=-1)
+    p = logp.exp()
+    entropy = float(-(p * logp).sum())                    # nats, full vocabulary
+    return entropy, float(p.max())
 
 
 # ======================================================================================
