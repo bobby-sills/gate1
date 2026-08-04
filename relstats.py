@@ -103,6 +103,32 @@ def space_stats(rows: list[dict]) -> dict:
     return out
 
 
+def _tvd_null(rows: list[dict], know: dict, n_perm: int = 2000):
+    """Total variation distance between the known and unknown relation mixes, with a
+    permutation reference. TVD is not 0 under the null -- at these cell sizes random
+    labels give ~0.07 from sampling alone -- so only the excess over the null is
+    evidence of a mix difference. Returns (obs, null median, p, n_known, n_unknown).
+    """
+    lab = [r for r in rows if know.get(r["qid"])]
+    ks = [know[r["qid"]] for r in lab]
+    rl = [r["relation"] for r in lab]
+
+    def tvd(kk):
+        a = Counter(x for x, k in zip(rl, kk) if k == "known")
+        b = Counter(x for x, k in zip(rl, kk) if k == "unknown")
+        na, nb = sum(a.values()) or 1, sum(b.values()) or 1
+        return sum(abs(a[x] / na - b[x] / nb) for x in set(a) | set(b)) / 2
+
+    obs = tvd(ks)
+    rng, null, sh = random.Random(gate1.SEED), [], list(ks)
+    for _ in range(n_perm):
+        rng.shuffle(sh)
+        null.append(tvd(sh))
+    null.sort()
+    return (obs, null[n_perm // 2], sum(v >= obs for v in null) / n_perm,
+            sum(k == "known" for k in ks), sum(k == "unknown" for k in ks))
+
+
 def print_table1(rows: list[dict], title: str):
     st = space_stats(rows)
     print("\n" + "=" * 78)
@@ -145,33 +171,16 @@ def print_table2(rows: list[dict], know: dict, st: dict, title: str):
     print("\n  (1) CELL MIX and (2) LABEL RATES, per relation")
     print(f"  {'relation':<26} {'n':>5} {'known':>6} {'unkn':>5} {'disc':>5}  "
           f"{'RESIST%':>8} {'CORRECT%':>9} {'delta':>7}")
-    tvd = 0.0
     for rel in rels:
         sub = [r for r in labelled if r["relation"] == rel]
         a, b = ck[rel], cu[rel]
         d = sum(r["_k"] == "discard" for r in sub)
         pa, pb = a / max(len(kn), 1), b / max(len(un), 1)
-        tvd += abs(pa - pb)
         print(f"  {rel:<26} {len(sub):>5} {a/len(sub):>5.0%} {b/len(sub):>4.0%} "
               f"{d/len(sub):>4.0%}  {pa:>7.1%} {pb:>8.1%} {pb-pa:>+7.1%}")
-    # TVD is not 0 under the null -- with these cell sizes, random labels give ~0.07 just
-    # from sampling. Permute the knowledge labels within the group to get the reference.
-    obs = tvd / 2
-    rng = random.Random(gate1.SEED)
-    ks = [r["_k"] for r in labelled]
-    rels_seq = [r["relation"] for r in labelled]
-    null = []
-    for _ in range(2000):
-        rng.shuffle(ks)
-        a = Counter(rl for rl, k in zip(rels_seq, ks) if k == "known")
-        b = Counter(rl for rl, k in zip(rels_seq, ks) if k == "unknown")
-        na, nb = sum(a.values()) or 1, sum(b.values()) or 1
-        null.append(sum(abs(a[x]/na - b[x]/nb) for x in set(a) | set(b)) / 2)
-    null.sort()
-    p = sum(v >= obs for v in null) / len(null)
+    obs, null_med, p, _, _ = _tvd_null(rows, know)
     print(f"\n  total variation distance between the two cells' relation mixes: {obs:.3f}")
-    print(f"  permutation null (2000 shuffles): median {null[1000]:.3f}, "
-          f"95th pct {null[1900]:.3f}, p = {p:.3f}")
+    print(f"  permutation null (2000 shuffles): median {null_med:.3f}, p = {p:.3f}")
     print("  (0 = identical mix, 1 = disjoint. This is the confound you flagged --")
     print("   but only the excess over the null is evidence of one.)")
 
@@ -311,6 +320,33 @@ def main(confiqa_path: str):
     know = {r["qid"]: r["knowledge"] for r in labels}
     print_table2(keep, know, st_keep, "SURVIVING POOL (FUNCTIONAL, self-answering removed)")
     print_table2(one, know, st_one, "ONE_TO_MANY ROWS -- the evidence for the exclusion")
+
+    # ---- does dropping small answer spaces remove the divergence? ----------------------
+    print("\n" + "=" * 78)
+    print("CELL SIZES AND MIX DIVERGENCE, by which relations are kept")
+    print("  target is 300 known + 300 unknown QUESTIONS (each yields two instances)")
+    print("=" * 78)
+    print(f"  {'subset':<26} {'rows':>5} {'known':>6} {'unkn':>6} {'TVD':>6} "
+          f"{'null':>6} {'p':>6}")
+    for name, rows in (("FUNCTIONAL (all)", keep),
+                       ("  large answer space", large),
+                       ("  small answer space", small),
+                       ("  large, minus spouse",
+                        [r for r in large if r["relation"] != "spouse"])):
+        o, m, p_, nk, nu = _tvd_null(rows, know)
+        print(f"  {name:<26} {len(rows):>5} {nk:>6} {nu:>6} {o:>6.3f} {m:>6.3f} "
+              f"{p_:>6.3f}  {'OK' if min(nk, nu) >= 300 else 'SHORT'}")
+
+    # Matched capacity: the largest relation-balanced pair of cells available. Sampling
+    # min(known, unknown) per relation makes the two cells' relation mixes identical by
+    # construction, which is the only way to remove the confound rather than shrink it.
+    cap = 0
+    for rel in {r["relation"] for r in keep}:
+        sub = [r for r in keep if r["relation"] == rel]
+        cap += min(sum(know.get(r["qid"]) == "known" for r in sub),
+                   sum(know.get(r["qid"]) == "unknown" for r in sub))
+    print(f"\n  relation-matched capacity across FUNCTIONAL: {cap} per cell "
+          f"({'sufficient' if cap >= 300 else 'INSUFFICIENT'} for 300)")
 
     # ---- (4) the comparison the exclusion rests on -------------------------------------
     print("\n" + "=" * 78)
