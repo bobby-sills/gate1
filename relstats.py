@@ -9,6 +9,7 @@ Nothing here writes to the pipeline outputs; it is a reporting script.
 """
 import ast
 import json
+import random
 import sys
 from collections import Counter, defaultdict
 
@@ -46,6 +47,11 @@ DROP = {
     "capital of": "4/5 self-answering",
 }
 
+# A relation counts as large-answer-space if its three commonest answers cover less
+# than this share of its rows. Chosen to sit in the gap between `official language`
+# (38%) and `currency` (21%); nothing downstream depends on it, it only labels a split.
+LARGE_SPACE_TOP3 = 0.30
+
 CLASS = {}
 for r in FUNCTIONAL:
     CLASS[r] = "FUNCTIONAL"
@@ -74,6 +80,120 @@ def self_answering(row: dict) -> bool:
     is being measured.
     """
     return gate1.alias_match(row["question"], row["gold_aliases"])
+
+
+def space_stats(rows: list[dict]) -> dict:
+    """relation -> answer-space summary over `rows`.
+
+    `ratio` (distinct/rows) is biased downward by n: a relation with 25 rows cannot
+    score low however open its answer space really is. `top3` -- the share of rows the
+    three commonest answers cover -- is the guessability measure that does not depend
+    on how many rows the relation happens to contribute.
+    """
+    g = defaultdict(list)
+    for r in rows:
+        g[r["relation"]].append(r)
+    out = {}
+    for rel, rs in g.items():
+        c = Counter(gate1.normalize(r["gold_aliases"][0]) for r in rs)
+        top = c.most_common(3)
+        out[rel] = {"n": len(rs), "distinct": len(c), "ratio": len(c) / len(rs),
+                    "top1": top[0][0], "top1_n": top[0][1],
+                    "top3_n": sum(k for _, k in top), "counter": c}
+    return out
+
+
+def print_table1(rows: list[dict], title: str):
+    st = space_stats(rows)
+    print("\n" + "=" * 78)
+    print(f"TABLE 1 -- ANSWER-SPACE SIZE: {title}")
+    print("=" * 78)
+    print(f"  {'relation':<26} {'rows':>5} {'distinct':>9} {'d/rows':>7} "
+          f"{'top-1':>6} {'top-3':>6}  {'commonest answer'}")
+    for rel, s in sorted(st.items(), key=lambda x: -x[1]["top3_n"] / x[1]["n"]):
+        print(f"  {rel:<26} {s['n']:>5} {s['distinct']:>9} {s['ratio']:>7.2f} "
+              f"{s['top1_n']/s['n']:>5.0%} {s['top3_n']/s['n']:>6.0%}  {s['top1'][:28]}")
+    return st
+
+
+def print_table2(rows: list[dict], know: dict, st: dict, title: str):
+    """(1) cell mix, (2) per-relation label rates, (3) majority-class check.
+
+    correction draws from questions labelled `unknown`, resistance from `known`
+    (gate1.CELLS), so the two cells' relation mixes are just those two distributions.
+    """
+    for r in rows:
+        r["_k"] = know.get(r["qid"])
+    labelled = [r for r in rows if r["_k"]]
+    kn = [r for r in labelled if r["_k"] == "known"]
+    un = [r for r in labelled if r["_k"] == "unknown"]
+    dc = [r for r in labelled if r["_k"] == "discard"]
+    print("\n" + "=" * 78)
+    print(f"TABLE 2 -- {title}")
+    print(f"  {len(labelled)}/{len(rows)} labelled | known {len(kn)} "
+          f"({len(kn)/max(len(labelled),1):.0%}) unknown {len(un)} "
+          f"({len(un)/max(len(labelled),1):.0%}) discard {len(dc)} "
+          f"({len(dc)/max(len(labelled),1):.0%})")
+    print("=" * 78)
+    if not labelled:
+        return
+
+    ck, cu = Counter(r["relation"] for r in kn), Counter(r["relation"] for r in un)
+    rels = sorted(set(ck) | set(cu), key=lambda x: -(ck[x] + cu[x]))
+
+    # (1) + (2)
+    print("\n  (1) CELL MIX and (2) LABEL RATES, per relation")
+    print(f"  {'relation':<26} {'n':>5} {'known':>6} {'unkn':>5} {'disc':>5}  "
+          f"{'RESIST%':>8} {'CORRECT%':>9} {'delta':>7}")
+    tvd = 0.0
+    for rel in rels:
+        sub = [r for r in labelled if r["relation"] == rel]
+        a, b = ck[rel], cu[rel]
+        d = sum(r["_k"] == "discard" for r in sub)
+        pa, pb = a / max(len(kn), 1), b / max(len(un), 1)
+        tvd += abs(pa - pb)
+        print(f"  {rel:<26} {len(sub):>5} {a/len(sub):>5.0%} {b/len(sub):>4.0%} "
+              f"{d/len(sub):>4.0%}  {pa:>7.1%} {pb:>8.1%} {pb-pa:>+7.1%}")
+    # TVD is not 0 under the null -- with these cell sizes, random labels give ~0.07 just
+    # from sampling. Permute the knowledge labels within the group to get the reference.
+    obs = tvd / 2
+    rng = random.Random(gate1.SEED)
+    ks = [r["_k"] for r in labelled]
+    rels_seq = [r["relation"] for r in labelled]
+    null = []
+    for _ in range(2000):
+        rng.shuffle(ks)
+        a = Counter(rl for rl, k in zip(rels_seq, ks) if k == "known")
+        b = Counter(rl for rl, k in zip(rels_seq, ks) if k == "unknown")
+        na, nb = sum(a.values()) or 1, sum(b.values()) or 1
+        null.append(sum(abs(a[x]/na - b[x]/nb) for x in set(a) | set(b)) / 2)
+    null.sort()
+    p = sum(v >= obs for v in null) / len(null)
+    print(f"\n  total variation distance between the two cells' relation mixes: {obs:.3f}")
+    print(f"  permutation null (2000 shuffles): median {null[1000]:.3f}, "
+          f"95th pct {null[1900]:.3f}, p = {p:.3f}")
+    print("  (0 = identical mix, 1 = disjoint. This is the confound you flagged --")
+    print("   but only the excess over the null is evidence of one.)")
+
+    # (3) majority-class check
+    print("\n  (3) MAJORITY-CLASS CHECK -- of rows labelled `known`, the share whose")
+    print("      gold IS that relation's commonest answer, against its base rate.")
+    print(f"  {'relation':<26} {'known':>6} {'base':>6} {'in known':>9} {'lift':>6}  "
+          f"{'commonest answer'}")
+    tot_known_maj = 0
+    for rel in rels:
+        s = st.get(rel)
+        if not s or ck[rel] == 0:
+            continue
+        base = s["top1_n"] / s["n"]
+        maj = sum(1 for r in kn if r["relation"] == rel
+                  and gate1.normalize(r["gold_aliases"][0]) == s["top1"])
+        tot_known_maj += maj
+        share = maj / ck[rel]
+        print(f"  {rel:<26} {ck[rel]:>6} {base:>5.0%} {share:>8.0%} "
+              f"{share/base if base else 0:>6.2f}  {s['top1'][:26]}")
+    print(f"\n  overall: {tot_known_maj}/{len(kn)} ({tot_known_maj/max(len(kn),1):.1%}) "
+          "of the `known` set is its relation's majority class")
 
 
 def _table2_fallback(keep: list[dict], stats: list):
@@ -163,55 +283,54 @@ def main(confiqa_path: str):
     keep = [r for r in pool if r["class"] == "FUNCTIONAL" and not r["self_answering"]]
     print(f"\n  SURVIVING GATE 1 POOL: {len(keep)}")
 
-    # ---- TABLE 1: answer-space size --------------------------------------------------
-    print("\n" + "=" * 78)
-    print("TABLE 1 -- ANSWER-SPACE SIZE (surviving FUNCTIONAL relations)")
-    print("=" * 78)
-    print(f"  {'relation':<28} {'rows':>5} {'distinct':>9} {'d/rows':>7}  {'top-5 answers'}")
-    grouped = defaultdict(list)
-    for r in keep:
-        grouped[r["relation"]].append(r)
-    stats = []
-    for rel, rows in grouped.items():
-        golds = [gate1.normalize(r["gold_aliases"][0]) for r in rows]
-        c = Counter(golds)
-        stats.append((rel, len(rows), len(c), len(c) / len(rows), c))
-    for rel, nrows, ndist, ratio, c in sorted(stats, key=lambda x: -x[3]):
-        top = ", ".join(f"{a}({k})" for a, k in c.most_common(5))
-        print(f"  {rel:<28} {nrows:>5} {ndist:>9} {ratio:>7.2f}  {top[:70]}")
+    # ---- TABLE 1 ----------------------------------------------------------------------
+    st_keep = print_table1(keep, "surviving FUNCTIONAL relations")
 
-    # ---- TABLE 2: relation mix by cell -----------------------------------------------
+    # large vs small split, and what each would leave. The floor is 300 known + 300
+    # unknown QUESTIONS, not a row count -- each question yields two instances.
+    big_rels = {rel for rel, s in st_keep.items()
+                if s["top3_n"] / s["n"] < LARGE_SPACE_TOP3}
+    large = [r for r in keep if r["relation"] in big_rels]
+    small = [r for r in keep if r["relation"] not in big_rels]
+    print(f"\n  large answer space (top-3 covers <{LARGE_SPACE_TOP3:.0%}): {len(large)}")
+    print(f"  small answer space                        : {len(small)}")
+    sp = Counter(r["relation"] for r in large)
+    print(f"  spouse share of the large-space pool      : {sp['spouse']}/{len(large)} "
+          f"({sp['spouse']/max(len(large),1):.1%})")
+
+    one = [r for r in pool if r["class"] == "ONE_TO_MANY" and not r["self_answering"]]
+    st_one = space_stats(one)
+
+    # ---- TABLE 2 ----------------------------------------------------------------------
     labels = gate1.read_jsonl("labels.jsonl")
     if not labels:
+        stats = [(rel, s["n"], s["distinct"], s["ratio"], s["counter"])
+                 for rel, s in st_keep.items()]
         _table2_fallback(keep, stats)
         return
     know = {r["qid"]: r["knowledge"] for r in labels}
+    print_table2(keep, know, st_keep, "SURVIVING POOL (FUNCTIONAL, self-answering removed)")
+    print_table2(one, know, st_one, "ONE_TO_MANY ROWS -- the evidence for the exclusion")
+
+    # ---- (4) the comparison the exclusion rests on -------------------------------------
     print("\n" + "=" * 78)
-    print("TABLE 2 -- RELATION MIX BY CELL, surviving pool")
-    print("  resistance draws from KNOWN questions, correction from UNKNOWN questions.")
+    print("(4) FUNCTIONAL vs ONE_TO_MANY, side by side")
     print("=" * 78)
-    for scope, rows in (("SURVIVING (functional-only)", keep), ("CURRENT 4207 POOL", pool)):
-        kn = [r for r in rows if know.get(r["qid"]) == "known"]
-        un = [r for r in rows if know.get(r["qid"]) == "unknown"]
-        dc = [r for r in rows if know.get(r["qid"]) == "discard"]
-        print(f"\n--- {scope}: known {len(kn)} / unknown {len(un)} / discard {len(dc)} ---")
-        ck, cu = Counter(r["relation"] for r in kn), Counter(r["relation"] for r in un)
-        rels = sorted(set(ck) | set(cu), key=lambda x: -(ck[x] + cu[x]))
-        print(f"  {'relation':<28} {'resist%':>8} {'correct%':>9} {'known-rate':>11} {'n':>6}")
-        for rel in rels:
-            a, b = ck[rel], cu[rel]
-            if a + b == 0:
-                continue
-            print(f"  {rel:<28} {a/max(len(kn),1):>7.1%} {b/max(len(un),1):>8.1%} "
-                  f"{a/(a+b):>10.1%} {a+b:>6}")
-        # answer-space correlation, only meaningful on the surviving set
-        if scope.startswith("SURVIVING"):
-            print("\n  known-rate vs answer-space size (distinct/rows), by relation:")
-            for rel, nrows, ndist, ratio, _ in sorted(stats, key=lambda x: -x[3]):
-                a, b = ck[rel], cu[rel]
-                if a + b == 0:
-                    continue
-                print(f"    {rel:<28} space={ratio:>5.2f}  known-rate={a/(a+b):>6.1%}")
+    print(f"  {'group':<22} {'n':>6} {'known':>7} {'unknown':>8} {'discard':>8} "
+          f"{'maj-class of known':>19}")
+    for name, rows, st in (("FUNCTIONAL", keep, st_keep),
+                           ("ONE_TO_MANY", one, st_one)):
+        lab = [r for r in rows if know.get(r["qid"])]
+        if not lab:
+            continue
+        kn = [r for r in lab if know[r["qid"]] == "known"]
+        maj = sum(1 for r in kn
+                  if gate1.normalize(r["gold_aliases"][0]) == st[r["relation"]]["top1"])
+        print(f"  {name:<22} {len(lab):>6} "
+              f"{sum(know[r['qid']]=='known' for r in lab)/len(lab):>6.0%} "
+              f"{sum(know[r['qid']]=='unknown' for r in lab)/len(lab):>7.0%} "
+              f"{sum(know[r['qid']]=='discard' for r in lab)/len(lab):>7.0%} "
+              f"{maj/max(len(kn),1):>18.0%}")
 
 
 if __name__ == "__main__":
