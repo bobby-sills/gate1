@@ -277,6 +277,13 @@ check(dg["diverged"], "the divergence is DETECTED rather than reported as a null
 check(gate2b._decide(0.10, 0.04, 0.05, 0.02, "b1", pooled_ok=False).startswith("NO VERDICT"),
       "a diverged pooling gives NO VERDICT, not a STOP")
 
+# rank pooling is monotone WITHIN a fold, so it must preserve every per-fold AUC exactly
+# -- that is the property that makes it a re-pooling rather than a different measurement.
+rk = gate2b.rank_pool(drift, folds_p)
+check(all(abs(gate2._auc(yp[te], drift[te]) - gate2._auc(yp[te], rk[te])) < 1e-12
+          for _, te in folds_p), "rank_pool preserves every per-fold AUC exactly")
+check(gate2._auc(yp, rk) == 1.0, "rank_pool recovers the signal the raw pooling destroyed")
+
 # ---- train ---------------------------------------------------------------------------------
 print("\nPHASE B -- train")
 write_gate2_shard(list(meta.qid))
@@ -291,6 +298,12 @@ check(set(pl) >= {"per_fold_mean", "pooled_auc", "offset_ratio", "diverged"},
       f"{pl['pooled_auc']:.4f}, offset ratio {pl['offset_ratio']:.3f})")
 check(pl["per_fold_mean"] > pl["pooled_auc"],
       "pooling COSTS the probe AUC even at healthy scales -- the direction of the bias")
+sec = folds["rank_secondary"]
+check(set(sec) == {"probe_auc", "baseline_auc", "best_baseline", "diff"},
+      f"rank-pooled secondary recorded alongside the pre-registered number "
+      f"(probe {sec['probe_auc']:.4f} vs pre-registered {folds['probe_auc']:.4f})")
+check(sec["probe_auc"] >= folds["probe_auc"],
+      "re-pooling by rank does not cost the probe -- the bias has one direction")
 check(tuple(folds["c_grid"]) == tuple(gate2.C_GRID_WIDE),
       "training used the INHERITED widened grid, not Gate 2's pre-registered one")
 check(set(folds["baseline_auc"]) == set(gate2b.BASELINES), "all four baselines scored")

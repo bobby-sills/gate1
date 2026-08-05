@@ -500,6 +500,34 @@ def pooling_diagnostic(y, oof, folds):
             "diverged": bool(abs(pooled - per_mean) > POOLING_DIVERGENCE)}
 
 
+def rank_pool(s, folds):
+    """Within-fold percentile ranks, in [0, 1). DECLARED POST-HOC SECONDARY.
+
+    Monotone inside each fold, so every per-fold AUC is preserved exactly; the only thing
+    that changes is how folds are compared with EACH OTHER. Instead of ranking a row by
+    whatever offset its fold's intercept happened to land on, it is ranked by its standing
+    among its own fold's peers.
+
+    Applied identically to the probe and to all four baselines. Applying it to the probe
+    alone would swap one asymmetry for another.
+
+    Its standing is NOT "an alternative that might disagree by chance". The raw-pooled
+    number has a bias with a KNOWN SIGN, applied ASYMMETRICALLY: the probe's pooled vector
+    is stitched from five separately fitted models and the baselines are single global
+    scalars that pay none of it. So the pre-registered number remains the headline for
+    pre-registration integrity, and a disagreement between the two is a measurement
+    artifact with a known direction -- not two estimates to weigh evenly.
+
+    Measured on Gate 2's real data (`pooling_recheck.py`, 2026-08-05) the effect there was
+    +0.0009 and changed no verdict.
+    """
+    from scipy.stats import rankdata
+    out = np.full(len(s), np.nan)
+    for _, te in folds:
+        out[te] = rankdata(s[te]) / (len(te) + 1)
+    return out
+
+
 def _print_pooling(d):
     print(f"\n  pooling check: per-fold AUC mean {d['per_fold_mean']:.4f}  vs  pooled "
           f"{d['pooled_auc']:.4f}")
@@ -512,6 +540,23 @@ def _print_pooling(d):
     print("  them ranks calibration drift rather than knowledge. Every number read off the")
     print("  pooled vector -- the margin, the CI, C1, C4 -- inherits this. STOP and decide")
     print("  how to pool before reading any verdict below as a result.")
+
+
+def _rank_secondary(y, oof, cand, groups, folds):
+    """The whole comparison re-pooled by within-fold rank. No probe is refitted.
+
+    Refitting would be wrong as well as wasteful: the fitted models are exactly the ones
+    the pre-registered analysis used, and only the rule for combining their scores changes.
+    BEST is recomputed within the secondary, because the strongest baseline under one
+    pooling rule need not be the strongest under the other.
+    """
+    rp = {k: rank_pool(v, folds) for k, v in cand.items()}
+    probe_r = rank_pool(oof, folds)
+    aucs = {k: gate2._auc(y, v) for k, v in rp.items()}
+    name = max(aucs, key=lambda k: aucs[k])
+    d, lo, hi = gate2.boot_auc_diff(y, probe_r, rp[name], groups)
+    return {"probe_auc": gate2._auc(y, probe_r), "baseline_auc": aucs,
+            "best_baseline": name, "diff": {"point": d, "lo": lo, "hi": hi}}
 
 
 def best_baseline(y, baselines, picks, folds):
@@ -564,6 +609,14 @@ def phase_train():
     print(f"  DeLong (secondary): z={z:.2f}  p={p:.3g}")
     pool_d = pooling_diagnostic(y, oof, folds)
     _print_pooling(pool_d)
+    sec = _rank_secondary(y, oof, cand, groups, folds)
+    print(f"\n  SECONDARY (declared post-hoc), within-fold rank pooling:")
+    print(f"    probe {sec['probe_auc']:.4f}   {sec['best_baseline']} "
+          f"{sec['baseline_auc'][sec['best_baseline']]:.4f}")
+    print(f"    probe - {sec['best_baseline']} = {sec['diff']['point']:+.4f}  "
+          f"[{sec['diff']['lo']:+.4f}, {sec['diff']['hi']:+.4f}]")
+    print(f"    shift vs the pre-registered point estimate: "
+          f"{sec['diff']['point'] - d:+.4f}")
     print("\n  Pooled number ONLY. C1 is a VETO and can still turn this into a STOP.")
     print("  HUMAN CHECK: read the above, then run `python gate2b.py tests`.")
 
@@ -574,7 +627,7 @@ def phase_train():
              **{k: v for k, v in cand.items()},
              **{f"raw_{k}": v for k, v in baselines.items()})
     json.dump({"folds": picks, "probe_auc": probe_auc, "baseline_auc": aucs,
-               "best_baseline": name, "pooling": pool_d,
+               "best_baseline": name, "pooling": pool_d, "rank_secondary": sec,
                "probe_minus_best": {"point": d, "lo": lo, "hi": hi},
                "delong_z": z, "delong_p": p, "n": int(len(y)),
                "c_grid": list(C_GRID), "positions": list(POSITIONS)},
@@ -685,6 +738,16 @@ def phase_tests():
     folds_p = gate2.group_folds(groups, N_FOLDS, SEED)
     pool_d = pooling_diagnostic(y, oof, folds_p)
     _print_pooling(pool_d)
+    sec = _rank_secondary(y, oof, cand, groups, folds_p)
+    print(f"\n  SECONDARY (declared post-hoc), within-fold rank pooling:")
+    print(f"    probe {sec['probe_auc']:.4f}   best {sec['best_baseline']} "
+          f"{sec['baseline_auc'][sec['best_baseline']]:.4f}   diff "
+          f"{sec['diff']['point']:+.4f} [{sec['diff']['lo']:+.4f}, "
+          f"{sec['diff']['hi']:+.4f}]")
+    print("    The pre-registered raw-pooled number above remains the headline. Where the")
+    print("    two disagree that is a measurement artifact with a known direction -- the")
+    print("    raw pooling costs the PROBE and not the baselines -- not two estimates to")
+    print("    weigh evenly. See GATE2B_PROTOCOL 'Secondary analyses'.")
 
     # ---- C0 -- reported whatever it shows (invariant 7) ---------------------------------
     d0 = stratify_by_generation(y, {"probe": oof, name: best}, correct)
@@ -763,7 +826,7 @@ def phase_tests():
                "c2_loro": d2.to_dict("records"),
                "c3_spouse_excluded": {"means": m3, "diff": d_sp},
                "c4_positions": d4.to_dict("records"),
-               "pooling": pool_d, "verdict": verdict},
+               "pooling": pool_d, "rank_secondary": sec, "verdict": verdict},
               open(gate1._path(RESULTS_FILE), "w"), indent=2, default=float)
 
 

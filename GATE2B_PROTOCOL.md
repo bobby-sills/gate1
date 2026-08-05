@@ -308,6 +308,51 @@ bootstrap governs and the disagreement is reported.
 
 ---
 
+## Secondary analyses
+
+### RANK — within-fold rank pooling
+
+**Why it was raised.** The primary number concatenates the raw `decision_function` values
+of five separately fitted probes and ranks the whole vector. That is valid only while each
+fold's scores vary a lot compared with the offsets *between* folds. Strong L2 shrinks the
+coefficients toward zero but not the intercept, which sklearn does not penalise, so the two
+can invert: on the Gate 2b selftest fixture at `C=1e-5` — a value in the grid this protocol
+inherits — every fold scores AUC 1.0000 and the pooled vector scores 0.5024.
+
+**Why it is not symmetric.** The probe's pooled vector is stitched from five models. b1–b4
+are single global scalars with no fold structure and pay none of this cost. Whatever
+pooling costs is therefore subtracted from the probe alone.
+
+**The rule.** `rank_pool` converts each fold's scores to within-fold percentile ranks. It
+is monotone inside a fold, so every per-fold AUC is preserved exactly; only the cross-fold
+comparisons change. It is applied identically to the probe and to all four baselines —
+applying it to the probe alone would swap one asymmetry for another. No probe is refitted:
+the fitted models are the pre-registered ones and only the combining rule changes.
+
+**Its standing, and this is a correction to how WIDE was framed.** "The pre-registered
+result governs on disagreement" is the right rule when two estimators are both unbiased and
+differ by chance. That is not this case. Here one estimator has a **systematic bias with a
+known sign, applied asymmetrically**. So:
+
+> The pre-registered raw-pooled number remains the headline, for pre-registration
+> integrity. But a disagreement between the two is a **measurement artifact with a known
+> direction**, not evidence to be weighed evenly. Report it as such.
+
+**Gate 2 was rechecked before Gate 2b extraction** (`pooling_recheck.py`, 2026-08-05), on
+the pre-registered and the wide artifacts. The result: no meaningful effect on the real
+data. All five folds had selected `C=1e-3`, the between-fold offset was 0.044 of the
+within-fold range for the probe (the degenerate fixture sits at 11.96), per-fold and pooled
+AUC agreed to +0.0006, and the headline moved from +0.0095 [−0.0083, +0.0271] to +0.0104
+[−0.0069, +0.0279] — a shift of +0.0009, with the same STOP under both rules. **Gate 2's
+published conclusion does not depend on the pooling rule.** The concern was real, was
+checked against the real data before it could affect anything, and changed nothing.
+
+`pooling_diagnostic` runs every Gate 2b phase regardless. If the divergence is severe,
+`_decide` returns **NO VERDICT** rather than a STOP — a STOP would claim the probe does not
+separate, and a failed pooling check says only that we cannot tell.
+
+---
+
 ## Not in scope, deliberately
 
 - **Stage 2.** No rewind, no gated re-decode, no `k` fed into `tau`. Gate 2b is the probe
@@ -359,3 +404,7 @@ bootstrap governs and the disagreement is reported.
 
 8. **Gate 2's null is the headline.** Gate 2b cannot revise it. A PROCEED here means "a
    different read position works", never "Gate 2 was wrong".
+
+9. **A failed pooling check is NO VERDICT, not a STOP.** The two say different things. A
+   STOP claims the probe does not separate; a failed pooling check says the primary number
+   is not measuring separation, so we do not know. See *Secondary analyses*.
