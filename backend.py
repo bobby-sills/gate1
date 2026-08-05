@@ -889,3 +889,129 @@ def hidden_states(question: str, subject: str | None = None) -> dict:
         "span_tier": tier,
         "n_tokens": int(ids.shape[1]),
     }
+
+
+# ======================================================================================
+# 6. GATE 2b -- ANSWER-TOKEN STATES  (see GATE2B_PROTOCOL.md Phase A)
+# ======================================================================================
+
+def _entropies(logits):
+    """Row-wise entropy in nats over the full vocabulary, and the row-wise max prob."""
+    import torch
+    logp = torch.log_softmax(logits, dim=-1)
+    p = logp.exp()
+    return (-(p * logp).sum(dim=-1), p.max(dim=-1).values, logp)
+
+
+def answer_states(question: str, max_new_tokens: int = MAX_NEW_TOKENS) -> dict:
+    """Stage 1 of the Gate 2b mechanism: greedy-complete the closed-book answer, then read
+    the residual stream at the ANSWER tokens.
+
+    Returns
+        h_first / h_last / h_mean   float16 [n_layers, hidden], or None if no answer span
+        answer                      str    the decoded answer, specials stripped
+        n_answer_tokens             int    m
+        entropy / max_prob          float  at the final QUESTION token -- the parity pair
+        first_token_is_argmax       bool   see below
+        b2_first / b2_last / b2_mean  float  H(p_theta) at each read position
+        b3_mean_logprob             float  (1/m) sum_j log p(a_j)
+        n_tokens                    int    prompt length
+
+    THIS IS A FOURTH FORWARD PASS and it must not be merged into any of the others. Gate 1
+    invariant #2 forbids sharing computation between the label pass and the predictor pass;
+    this one runs after both are on disk and shares computation with neither, exactly as
+    `hidden_states` does. The ten Phase 2 samples that Gate 2b's b4 needs are obtained by a
+    SEPARATE call to `sample_closed_book`, not from here.
+
+    Two structural points, both registered in GATE2B_PROTOCOL Phase A:
+
+    The second pass is TEACHER-FORCED over [prompt + answer] rather than harvested from
+    `generate`. `generate` computes a hidden state at a position only when it feeds that
+    position back in, so when the answer ends in EOS the state at the last answer token is
+    never computed -- p2 would be silently undefined for exactly the questions where the
+    model finished cleanly. One extra pass of length n+m removes that whole class of bug.
+
+    `first_token_is_argmax` checks that the greedy answer's first token is the argmax of
+    the distribution `deterministic_features` measured at the final question token. That is
+    the sense in which stage 1 "continues" that pass, and it is the assertion that would
+    catch a generation_config override silently perturbing the decode.
+    """
+    import torch
+
+    tok, model = _load()
+    prompt = _build_prompt(question, None)              # None -> closed book, as Phase 2
+    ids = _encode(prompt)
+    n = ids.shape[1]
+
+    # ---- stage 1: greedy completion --------------------------------------------------
+    # temperature/top_p from Llama-3.1's shipped generation_config are inert under
+    # do_sample=False (transformers builds the warpers only in sample mode), unlike in
+    # sample_closed_book where they had to be disabled explicitly.
+    with torch.inference_mode():
+        gen = model.generate(ids, do_sample=False, max_new_tokens=max_new_tokens,
+                             pad_token_id=tok.eos_token_id)
+
+    # Truncate at the first special token rather than filtering them out: a special in the
+    # middle ends the answer, and keeping what follows would splice a second turn onto it.
+    specials = set(tok.all_special_ids)
+    core = []
+    for t in gen[0, n:].tolist():
+        if t in specials:
+            break
+        core.append(t)
+    m = len(core)
+
+    if m == 0:
+        # No usable answer span. Dropped from Gate 2b entirely and counted -- NOT
+        # backfilled with the question-final token, which would quietly turn the row into
+        # a Gate 2 row and destroy the position comparison. GATE2B_PROTOCOL invariant 4.
+        with torch.inference_mode():
+            logits = model(ids).logits[0, -1:, :].float()
+        ent, mx, _ = _entropies(logits)
+        return {"h_first": None, "h_last": None, "h_mean": None, "answer": "",
+                "n_answer_tokens": 0, "entropy": float(ent[0]), "max_prob": float(mx[0]),
+                "first_token_is_argmax": False, "b2_first": float("nan"),
+                "b2_last": float("nan"), "b2_mean": float("nan"),
+                "b3_mean_logprob": float("nan"), "n_tokens": int(n)}
+
+    # ---- stage 2: one teacher-forced pass over prompt + answer ------------------------
+    full = torch.cat([ids, torch.tensor([core], device=ids.device, dtype=ids.dtype)], dim=1)
+    with torch.inference_mode():
+        out = model(full, output_hidden_states=True)
+
+    # hidden_states is length n_layers+1: embeddings, then one per block. The embedding
+    # layer is kept as the null control for the depth curve, as in `hidden_states`.
+    hs = torch.stack([h[0] for h in out.hidden_states])   # [n_layers, n+m, hidden]
+
+    # Positions, 0-based into `full`: a_j sits at n+j-1. The distribution produced AT a
+    # position is over the NEXT token, so the slice below starts one position early.
+    #   slice index 0   -> at t_n,     distribution over a_1   (this is b1 / Phase 2)
+    #   slice index j   -> at a_j,     distribution over a_{j+1}
+    #   slice index m   -> at a_m,     distribution over whatever follows the answer
+    logits = out.logits[0, n - 1:n + m, :].float()        # [m+1, V]
+    ent, mx, logp = _entropies(logits)
+
+    tgt = torch.tensor(core, device=logits.device)
+    tok_logp = logp[:m].gather(1, tgt.unsqueeze(1)).squeeze(1)   # log p(a_j), j=1..m
+
+    def h(sl):
+        return sl.float().cpu().numpy().astype("float16")
+
+    return {
+        "h_first": h(hs[:, n, :]),
+        "h_last": h(hs[:, n + m - 1, :]),
+        "h_mean": h(hs[:, n:n + m, :].mean(dim=1)),
+        "answer": tok.decode(core, skip_special_tokens=True).strip(),
+        "n_answer_tokens": int(m),
+        # The parity pair: recomputed at the final QUESTION token, so it must reproduce
+        # what labels.jsonl holds. b1 itself is read from labels.jsonl, not from here.
+        "entropy": float(ent[0]),
+        "max_prob": float(mx[0]),
+        "first_token_is_argmax": bool(int(logits[0].argmax()) == core[0]),
+        # b2 at each read position. b2_first is one token PAST b1 and must not equal it.
+        "b2_first": float(ent[1]) if m >= 1 else float("nan"),
+        "b2_last": float(ent[m]),
+        "b2_mean": float(ent[1:m + 1].mean()),
+        "b3_mean_logprob": float(tok_logp.mean()),
+        "n_tokens": int(n),
+    }
