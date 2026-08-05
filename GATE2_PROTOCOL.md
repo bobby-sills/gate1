@@ -283,6 +283,38 @@ right order, wrong magnitude, and the magnitude is what `tau` consumes.
 
 ---
 
+## Secondary analyses
+
+Declared post-hoc, on the same standing UNMATCHED had in Gate 1: reported alongside the
+pre-registered result, never in place of it. **If a secondary analysis disagrees with the
+pre-registered result, the pre-registered one governs and the disagreement is reported.**
+
+### WIDE — extended regularization grid
+
+**Why it was run.** The pre-registered run selected `C=1e-3` — the strongest
+regularization in `C_GRID` — in 5/5 folds. A selection that lands on a grid boundary in
+every fold is the signature of a grid that does not extend far enough, and with 4096
+features against ~1200 training rows the optimum could plausibly sit below it. That would
+understate the probe.
+
+**Why it is secondary and not a correction.** It was chosen *after* seeing a failing
+pre-registered result. Quietly widening a search until the answer improves is how a study
+of this shape talks itself into a false positive, so the widened grid writes to its own
+files (`probe_folds_wide.json`, `probe_oof_wide.npz`, and separate checkpoints) and cannot
+overwrite the pre-registered artifacts.
+
+    C_GRID_WIDE = (1e-5, 1e-4) + C_GRID
+    python gate2.py train --wide
+
+**Result, 2026-08-05: no disagreement.** All five folds selected `C=1e-3` again with 1e-4
+and 1e-5 available, at identical layers (27, 32, 24, 21, 19) and identical inner AUCs. The
+pooled numbers reproduce exactly: probe 0.8690, entropy 0.8596, difference +0.0095
+[−0.0083, +0.0271]. The boundary was not binding — `1e-3` is an interior optimum that
+happened to sit at the edge of the pre-registered grid. The concern was worth raising and
+did not change anything.
+
+---
+
 ## Not in scope, deliberately
 
 - **Re-running the decoder with probe-derived `k`.** The AUC result plus the Gate 1

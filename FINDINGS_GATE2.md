@@ -1,8 +1,8 @@
 # Gate 2: what we found
 
 **Status.** Complete. The pre-registered result is in, along with four diagnostics and one
-declared follow-up analysis. Gate 3 has not been started and, on this evidence, should not
-be.
+declared follow-up analysis, which agreed with it. Gate 3 has not been started and, on this
+evidence, should not be.
 
 ---
 
@@ -214,13 +214,12 @@ that might have been cleaner isn't.
 
 ## 8. Things that could be wrong, stated plainly
 
-**The strongest constraint was always chosen.** The probe could constrain itself to one of
-four degrees, and in all five groups the most constrained option won. When the best setting
-is at the edge of the range you offered, the real best setting may lie beyond it. We are
-running a follow-up with a wider range — see section 9. It is declared as a follow-up rather
-than folded into the headline, because it was chosen *after* seeing a failing result, and
-quietly widening a search until the answer improves is how this kind of study talks itself
-into a false positive.
+**The strongest constraint was always chosen** — *tested, and it turned out not to matter.*
+The probe could constrain itself to one of four degrees, and in all five groups the most
+constrained option won. When the best setting sits at the edge of the range you offered, the
+real best setting may lie beyond it, which would mean we had understated the probe. We tested
+this directly by offering two stronger options and re-running. See section 9: nothing
+changed.
 
 **Seven question types could not be tested.** Scoring requires examples of both knowing and
 not knowing. `currency` (100% known), `continent` (96%), and `capital` (95%) have almost no
@@ -240,11 +239,36 @@ in principle favour the probe. Testing that is a separate piece of work.
 
 ---
 
-## 9. The follow-up analysis
+## 9. The follow-up analysis: we checked, and nothing changed
 
-*(To be completed when the wider-range run finishes. The pre-registered result above is the
-headline regardless of what it shows; if the two disagree, the pre-registered one governs and
-the disagreement is reported here.)*
+The one loose thread in section 8 was that the probe always chose the most constrained
+setting available, which raises the worry that a still-more-constrained setting — one we
+never offered — would have done better and made the probe look stronger than it did.
+
+So we offered two, both an order of magnitude beyond the previous limit, and ran the whole
+thing again.
+
+**Every group chose the same setting as before.** Same setting, same processing stage, same
+scores, to the digit:
+
+| | pre-registered | wider range |
+|---|---|---|
+| probe | 0.8690 | 0.8690 |
+| hesitancy | 0.8596 | 0.8596 |
+| difference | +0.0095 [−0.0083, +0.0271] | +0.0095 [−0.0083, +0.0271] |
+| stages chosen | 27, 32, 24, 21, 19 | 27, 32, 24, 21, 19 |
+
+Given stronger options, the procedure declined them. The setting that looked like it was
+pressed against a wall was simply the best one, and the wall happened to be right behind it.
+
+This was worth doing rather than assuming either way — a boundary hit in five out of five
+groups is exactly the pattern you should distrust. But the result is that the headline needs
+no revision and no hedging. **The two analyses agree, so the question of which one governs
+never arises.**
+
+One caveat on how much comfort to take. This rules out the probe having been handicapped by
+*how strongly it was constrained*. It does not rule out a fundamentally different probe doing
+better — see section 10.
 
 ---
 
