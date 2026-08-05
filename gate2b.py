@@ -249,6 +249,10 @@ def _checkpoint_a():
     of the checkpoint -- if b4 alone is already at 0.87 we know it before spending anything
     on training.
     """
+    # Tokenizer only -- _build_prompt goes through _load_tok, not _load, so `checkpoint`
+    # still runs on a CPU session with no model download.
+    import backend
+
     H, mask, meta = load_acts()
     # The stored mask and the stored span length are written by the same loop but from
     # different fields; if they ever disagree, one of the two is stale and every row index
@@ -285,11 +289,43 @@ def _checkpoint_a():
     j = meta.merge(lab, on="qid", suffixes=("_new", "_old"))
     d_ent = (j.entropy_new - j.entropy_old).abs()
     d_mp = (j.max_prob_new - j.max_prob_old).abs()
+    # The STRING-level check first, because it is the one that is hardware-independent.
+    # The numeric check below is only a PROXY for "the prompt is unchanged": identical
+    # prompt => identical numbers, ON IDENTICAL HARDWARE. Run on a different GPU
+    # architecture the proxy stops working -- it can no longer separate "the prompt
+    # changed" from "the kernels changed". Measured L4 -> A100 on this pool, 2026-08-05:
+    # median |d entropy| 1.27e-2 with a byte-identical prompt, which is above PARITY_STOP
+    # on its own. GATE2_PROTOCOL Phase A registers this check; gate2b did not run it until
+    # that failure made the omission expensive.
+    pool = gate1.read_jsonl("pool.jsonl")
+    try:
+        n_bad = sum(1 for r in pool
+                    if backend._build_prompt(r["question"], None)
+                    != backend.render_prompts(r["question"], r["factual_context"])[0])
+        print(f"\n  prompt STRING identity vs render_prompts: "
+              f"{len(pool) - n_bad} / {len(pool)}"
+              + ("" if n_bad == 0 else f"   <-- {n_bad} MISMATCHES"))
+    except (ImportError, KeyError, OSError) as e:
+        # Loud, not silent. This check is what distinguishes a template change from a
+        # hardware change, so "it did not run" must never read like "it passed".
+        n_bad = None
+        print(f"\n  prompt STRING identity: **NOT RUN** ({type(e).__name__}) -- needs the "
+              f"real tokenizer\n    and pool.jsonl's factual_context. Without it the "
+              f"numeric parity below cannot\n    tell a template change from a GPU change.")
+
     print(f"\n  prompt parity vs labels.jsonl on {len(j)} questions")
-    print(f"    max |d entropy|  = {d_ent.max():.2e}   (warn {PARITY_WARN:.0e}, "
+    print(f"    median |d entropy| = {d_ent.median():.2e}")
+    print(f"    max    |d entropy| = {d_ent.max():.2e}   (warn {PARITY_WARN:.0e}, "
           f"stop {PARITY_STOP:.0e})")
-    print(f"    max |d max_prob| = {d_mp.max():.2e}")
-    if d_ent.max() > PARITY_STOP:
+    print(f"    max    |d max_prob| = {d_mp.max():.2e}")
+    print(f"    exactly 0.0        = {int((d_ent == 0).sum())} / {len(j)}")
+    if d_ent.max() > PARITY_STOP and n_bad == 0:
+        print("\n  STOP, but read the two lines above together. The prompt is BYTE-IDENTICAL")
+        print("  and the numbers still differ, so this is a hardware change, not a template")
+        print("  change. Phase 2 and Gate 2's extraction ran on one GPU; if this is another,")
+        print("  b4 cannot recover the label-producing samples either. Re-extract on the")
+        print("  Phase 2 hardware rather than relaxing this threshold.")
+    elif d_ent.max() > PARITY_STOP:
         print("\n  STOP: the extraction prompt is NOT the Phase 2 prompt. Do not train.")
     elif d_ent.max() > PARITY_WARN:
         print("\n  PASS with a note: consistent with bf16 kernel nondeterminism across "
