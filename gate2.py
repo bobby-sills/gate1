@@ -37,6 +37,17 @@ C_GRID = (1e-3, 1e-2, 1e-1, 1.0)     # strong L2 first; sklearn's C is inverse s
 INNER_FRAC = 0.25                    # held out inside each training fold for selection
 MAX_ITER = 1000
 
+# POST-HOC, declared. The pre-registered run selected C=1e-3 -- the strongest
+# regularization in C_GRID -- in 5/5 folds, which is the signature of a grid whose
+# boundary was hit. With 4096 features and ~1200 training rows the optimum may sit below
+# it, so the probe could be understated. `--wide` extends the grid downward and writes to
+# its own files. It is a SENSITIVITY ANALYSIS, not the headline: it was chosen after
+# seeing a failing pre-registered result, which is exactly the circumstance under which a
+# post-hoc grid change would otherwise invalidate a pre-registration. If the two disagree,
+# the pre-registered result governs and the disagreement is reported. See
+# GATE2_PROTOCOL.md "Secondary analyses".
+C_GRID_WIDE = (1e-5, 1e-4) + C_GRID
+
 PROCEED_AUC_MARGIN = 0.03            # probe - entropy, pooled entity-disjoint CV
 WITHIN_RELATION_MARGIN = 0.02        # locked 2026-08-04 -- see GATE2_PROTOCOL Phase 0
 MIN_RELATION_N = 60                  # inclusion floor for C1
@@ -52,6 +63,15 @@ PARITY_STOP = 1e-2                   # ... and refuse to train above this
 POSITIONS = ("final", "subject")
 
 RNG = np.random.default_rng(SEED)
+
+# Which artifact set the phases read and write. `--wide` selects the declared secondary
+# run so it cannot overwrite the pre-registered one -- including the checkpoints, whose
+# fingerprint covers the row set but not the alpha grid, so shared checkpoint files would
+# silently serve pre-registered folds to the wide run.
+FOLDS_FILE = "probe_folds.json"
+OOF_FILE = "probe_oof.npz"
+RESULTS_FILE = "gate2_results.json"
+CALIB_FILE = "calibration.json"
 
 
 def _confiqa_path() -> str:
@@ -507,12 +527,12 @@ def phase_train():
 
     # str, not object: pandas hands back object arrays and np.load refuses those without
     # allow_pickle, which this repo does not enable for data it will later trust.
-    np.savez(gate1._path("probe_oof.npz"), oof=oof, y=y, ent=ent, mp=mp,
+    np.savez(gate1._path(OOF_FILE), oof=oof, y=y, ent=ent, mp=mp,
              groups=groups.astype(str), rel=rel.astype(str), qids=qids.astype(str))
     json.dump({"folds": picks, "pooled_auc": aucs,
                "probe_minus_entropy": {"point": d, "lo": lo, "hi": hi},
                "delong_z": z, "delong_p": p, "n": int(len(y))},
-              open(gate1._path("probe_folds.json"), "w"), indent=2)
+              open(gate1._path(FOLDS_FILE), "w"), indent=2)
 
 
 # ======================================================================================
@@ -520,7 +540,7 @@ def phase_train():
 # ======================================================================================
 
 def _load_oof():
-    z = np.load(gate1._path("probe_oof.npz"), allow_pickle=False)
+    z = np.load(gate1._path(OOF_FILE), allow_pickle=False)
     return (z["oof"], z["y"], z["groups"].astype(str), z["rel"].astype(str),
             z["ent"], z["mp"], z["qids"].astype(str))
 
@@ -650,8 +670,14 @@ def phase_tests():
           f"   DeLong p={p_pool:.3g}")
 
     # ---- C1 ---------------------------------------------------------------------------
+    # C1 is a VETO: it can turn a passing pooled result into a STOP, never the reverse.
+    # When the pooled gate has already failed, C1 and C4 are run as diagnostics -- they
+    # say WHY, not WHETHER -- and the verdict below does not depend on them.
+    gated = d_pool >= PROCEED_AUC_MARGIN and lo_pool > 0
+    role = ("the test that decides" if gated else
+            "DIAGNOSTIC ONLY -- the pooled gate already failed, C1 cannot reverse that")
     d1, m1, ex1 = within_relation(y, scores, rel, groups)
-    _print_within(d1, m1, ex1, "C1. WITHIN-RELATION AUC -- the test that decides")
+    _print_within(d1, m1, ex1, f"C1. WITHIN-RELATION AUC -- {role}")
     d_wr = m1.get("probe", float("nan")) - m1.get("entropy", float("nan"))
     lo_wr, hi_wr = _boot_within(y, oof, -ent, rel, groups)
     print(f"\n  within-relation probe - entropy = {d_wr:+.4f} "
@@ -706,7 +732,7 @@ def phase_tests():
                "c2_loro": d2.to_dict("records"),
                "c3_spouse_excluded": {"means": m3, "diff": d_sp},
                "c4_positions": d4.to_dict("records")},
-              open(gate1._path("gate2_results.json"), "w"), indent=2, default=float)
+              open(gate1._path(RESULTS_FILE), "w"), indent=2, default=float)
 
 
 def _boot_within(y, s_a, s_b, rel, groups, n_boot=1000):
@@ -797,7 +823,7 @@ def phase_calibrate(n_bins: int = 10):
 
     json.dump({"ece": float(ece), "n_bins": n_bins, "reliability": rows,
                "auc_after_platt": _auc(y, p)},
-              open(gate1._path("calibration.json"), "w"), indent=2)
+              open(gate1._path(CALIB_FILE), "w"), indent=2)
 
 
 # ======================================================================================
@@ -806,7 +832,21 @@ PHASES = {"extract": phase_extract, "train": phase_train, "tests": phase_tests,
           "calibrate": phase_calibrate, "checkpoint": _checkpoint_a}
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in PHASES:
+    args = [a for a in sys.argv[1:] if a != "--wide"]
+    if "--wide" in sys.argv:
+        C_GRID = C_GRID_WIDE
+        FOLDS_FILE = "probe_folds_wide.json"
+        OOF_FILE = "probe_oof_wide.npz"
+        RESULTS_FILE = "gate2_results_wide.json"
+        CALIB_FILE = "calibration_wide.json"
+        CKPT_FOLDS = "probe_folds_ckpt_wide.jsonl"
+        CKPT_CURVE = "c4_curve_ckpt_wide.jsonl"
+        print(f"SECONDARY (POST-HOC) RUN: C_GRID = {C_GRID}")
+        print(f"  -> {FOLDS_FILE}, {OOF_FILE}")
+        print("  Declared sensitivity analysis. The pre-registered result is the "
+              "headline regardless\n  of what this produces; if they disagree, the "
+              "pre-registered one governs.\n")
+    if not args or args[0] not in PHASES:
         print(__doc__)
         sys.exit(1)
-    PHASES[sys.argv[1]](*sys.argv[2:])
+    PHASES[args[0]](*args[1:])
