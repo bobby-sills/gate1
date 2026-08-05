@@ -37,7 +37,7 @@ INNER_FRAC = 0.25                    # held out inside each training fold for se
 MAX_ITER = 1000
 
 PROCEED_AUC_MARGIN = 0.03            # probe - entropy, pooled entity-disjoint CV
-WITHIN_RELATION_MARGIN = 0.02        # PROPOSED, awaiting sign-off -- see GATE2_PROTOCOL
+WITHIN_RELATION_MARGIN = 0.02        # locked 2026-08-04 -- see GATE2_PROTOCOL Phase 0
 MIN_RELATION_N = 60                  # inclusion floor for C1
 MIN_MINORITY_N = 10                  # AUC is undefined single-class, unstable near it
 
@@ -591,7 +591,7 @@ def phase_tests():
     lo_wr, hi_wr = _boot_within(y, oof, -ent, rel, groups)
     print(f"\n  within-relation probe - entropy = {d_wr:+.4f} "
           f"[{lo_wr:+.4f}, {hi_wr:+.4f}]"
-          f"   (PROPOSED gate >= {WITHIN_RELATION_MARGIN}, CI excluding 0)")
+          f"   (gate >= {WITHIN_RELATION_MARGIN}, CI excluding 0)")
 
     # ---- C3 (reuses C1's machinery) ----------------------------------------------------
     d3, m3, ex3 = within_relation(y, scores, rel, groups, drop=("spouse",))

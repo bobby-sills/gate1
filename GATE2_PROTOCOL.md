@@ -35,7 +35,7 @@ Frozen before Phase A runs. Do not edit after extraction begins.
 | Primary number | pooled out-of-fold test AUC, entity-disjoint | |
 | Baselines | `H(p_theta)`, `max p_theta`, on identical folds | |
 | PROCEED if probe AUC − entropy AUC >= | **0.03**, bootstrap 95% CI excluding 0 | |
-| PROCEED also requires | the within-relation advantage survives (C1) | |
+| PROCEED also requires | within-relation (probe − entropy) >= **0.02**, CI excluding 0 (C1) | |
 | STOP if | < 0.03, **or** the within-relation advantage disappears | |
 | Bootstrap | 10,000 resamples, **resampled by `subject_qid`** | |
 | Seed | 20260803 (same as Gate 1) | |
@@ -46,11 +46,12 @@ not set the headline.
 
 ### What "the within-relation advantage survives" means
 
-*This threshold is not in the spec and is the one pre-registered quantity I did not set
-myself. It is marked PROPOSED until signed off, and Phase C does not run before then.*
+*This threshold was not in the spec. Raised before Phase A and set by the human on
+2026-08-04, alongside the three alternatives considered (0.03 to match the primary; CI
+only with no margin; point estimate only with no CI).*
 
-> **PROPOSED.** Survives = the n-weighted mean within-relation (probe AUC − entropy AUC)
-> is >= **0.02** with a bootstrap 95% CI excluding 0.
+> **LOCKED, 2026-08-04.** Survives = the n-weighted mean within-relation
+> (probe AUC − entropy AUC) is >= **0.02** with a bootstrap 95% CI excluding 0.
 
 Rationale for proposing 0.02 rather than reusing 0.03: the within-relation number is
 computed inside relations of 60–400 rows, so it is strictly noisier than the pooled
