@@ -208,6 +208,30 @@ check(not leak, "no subject_qid appears in both train and test of a fold")
 check(all(len(te) > 0 for _, te in fs), "every fold has a test slice")
 check(len(y) < N_Q, f"discards and unresolved spans dropped ({len(y)} of {N_Q})")
 
+# ---- fold checkpointing: resume must reproduce the run exactly -------------------------
+# The value of the checkpoint is entirely in whether reloading a fold gives the same
+# scores as recomputing it. If it does not, a disconnect silently changes the result
+# instead of merely costing time.
+print("\nPHASE B -- fold checkpoint resume")
+ck = gate1.read_jsonl(gate2.CKPT_FOLDS)
+check(len(ck) == gate2.N_FOLDS, f"{len(ck)} folds checkpointed")
+check(all(r["fp"] == ck[0]["fp"] for r in ck), "one fingerprint across folds")
+
+gate2.phase_train()                                   # second run, fully resumed
+folds2 = json.load(open(gate1._path("probe_folds.json")))
+check(folds2["pooled_auc"] == folds["pooled_auc"],
+      f"resumed run reproduces pooled AUC exactly ({folds2['pooled_auc']['probe']:.4f})")
+check([f["layer"] for f in folds2["folds"]] == [f["layer"] for f in folds["folds"]],
+      "resumed run reproduces the per-fold selection")
+check(len(gate1.read_jsonl(gate2.CKPT_FOLDS)) == gate2.N_FOLDS,
+      "resume refit nothing -- checkpoint did not grow")
+
+# a stale checkpoint from a different row set must be ignored, not silently reused
+stale = dict(ck[0]); stale["fp"] = "deadbeefcafe"
+gate2._ckpt_append(gate2.CKPT_FOLDS, stale)
+check(len(gate2._ckpt_load(gate2.CKPT_FOLDS, ck[0]["fp"])) == gate2.N_FOLDS,
+      "checkpoint from a different fingerprint is not loaded")
+
 # ---- tests ----------------------------------------------------------------------------
 print("\nPHASE C -- tests")
 gate2.phase_tests()

@@ -17,6 +17,7 @@ Reads GATE1_OUT for everything, same as gate1.py. Set it in a PYTHON cell:
 """
 
 import ast
+import hashlib
 import json
 import os
 import sys
@@ -267,6 +268,34 @@ def group_folds(groups, n_folds=N_FOLDS, seed=SEED):
             for k in range(n_folds)]
 
 
+CKPT_FOLDS = "probe_folds_ckpt.jsonl"
+CKPT_CURVE = "c4_curve_ckpt.jsonl"
+
+
+def _fingerprint(qids) -> str:
+    """Identity of the row set a checkpoint was computed against.
+
+    Folds are deterministic given (row set, SEED), so a fold's scores can be reused only
+    if the row set is the one they were fitted on. Without this a stale checkpoint from a
+    different pool would be silently reloaded and the out-of-fold scores would refer to
+    the wrong questions -- which no assertion downstream would catch.
+    """
+    return hashlib.sha1("|".join(map(str, qids)).encode("utf-8")).hexdigest()[:12]
+
+
+def _ckpt_load(name: str, fp: str) -> dict:
+    return {r["key"]: r for r in gate1.read_jsonl(name) if r.get("fp") == fp}
+
+
+def _ckpt_append(name: str, row: dict):
+    """fsync per unit. Five writes over 40 minutes -- the cost is nothing and the point is
+    that a disconnect costs one fold rather than the whole phase."""
+    with open(gate1._path(name), "a") as f:
+        f.write(json.dumps(row) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _fit_predict(Xtr, ytr, Xte, C):
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
@@ -306,18 +335,37 @@ def oof_fixed(Xl, y, groups, folds):
     return oof, chosen
 
 
-def oof_nested(X, y, groups, folds, verbose=True):
+def oof_nested(X, y, groups, folds, fp, verbose=True):
     """THE PRIMARY NUMBER. Position, layer and C are all selected on the inner split.
 
     Selecting the layer on the pooled test scores is the single easiest way to
     manufacture a passing Gate 2: 33 layers x 2 positions is 66 chances to overfit a
     selection, which is the same order as the effect being measured. So the selection
     happens inside the training fold and never sees the test slice.
+
+    RESUMABLE per fold. Each fold is 264 fits and the whole loop runs 30-45 minutes on a
+    Colab CPU; writing only at the end meant a disconnect cost the entire phase. Folds are
+    independent -- `_inner_split` is seeded with SEED + f and `group_folds` is
+    deterministic -- so a completed fold's scores are exactly what a re-run would
+    recompute, and reusing them changes nothing.
     """
     n_layers = X["final"].shape[1]
     oof = np.full(len(y), np.nan)
     picks = []
+    prev = _ckpt_load(CKPT_FOLDS, fp)
+    if prev and verbose:
+        print(f"  resuming {CKPT_FOLDS}: {len(prev)} / {len(folds)} folds already complete")
+
     for f, (tr, te) in enumerate(folds):
+        if str(f) in prev:
+            r = prev[str(f)]
+            assert r["test_idx"] == te.tolist(), (
+                f"fold {f} checkpoint covers different rows -- refusing to reuse it")
+            oof[te] = r["scores"]
+            picks.append({k: r[k] for k in
+                          ("fold", "position", "layer", "C", "inner_auc")})
+            continue
+
         itr, iva = _inner_split(tr, groups, SEED + f)
         best, best_auc = None, -np.inf
         for pos in POSITIONS:
@@ -331,8 +379,12 @@ def oof_nested(X, y, groups, folds, verbose=True):
         pos, L, C = best
         Xl = X[pos][:, L, :].astype(np.float32)
         oof[te] = _fit_predict(Xl[tr], y[tr], Xl[te], C)
-        picks.append({"fold": f, "position": pos, "layer": int(L), "C": C,
-                      "inner_auc": float(best_auc)})
+        pick = {"fold": f, "position": pos, "layer": int(L), "C": C,
+                "inner_auc": float(best_auc)}
+        picks.append(pick)
+        _ckpt_append(CKPT_FOLDS, {**pick, "fp": fp, "key": str(f),
+                                  "test_idx": te.tolist(),
+                                  "scores": oof[te].tolist()})
         if verbose:
             print(f"  fold {f}: selected {pos} layer {L} C={C} "
                   f"(inner AUC {best_auc:.4f})")
@@ -432,7 +484,7 @@ def phase_train():
           f"{len(C_GRID)} alphas\n")
 
     t0 = time.time()
-    oof, picks = oof_nested(X, y, groups, folds)
+    oof, picks = oof_nested(X, y, groups, folds, _fingerprint(qids))
     print(f"\n  ({time.time() - t0:.0f}s)")
 
     # Entropy is an UNCERTAINTY and the label is "known", so it enters flipped. An AUC of
@@ -553,18 +605,31 @@ def leave_one_relation_out(X, y, groups, rel):
     return pd.DataFrame(out)
 
 
-def position_curves(X, y, groups, folds):
+def position_curves(X, y, groups, folds, fp):
     """C4. Pooled OOF AUC per (position, layer), layer held FIXED so the curve is a curve.
 
     Both positions are scored on the same questions (build_matrix keeps only rows where
     both resolve), so neither is advantaged by an easier subset.
+
+    RESUMABLE per (position, layer), for the same reason oof_nested is: this is another
+    ~1650 fits with no natural stopping point.
     """
     n_layers = X["final"].shape[1]
+    prev = _ckpt_load(CKPT_CURVE, fp)
+    if prev:
+        print(f"  resuming {CKPT_CURVE}: {len(prev)} / {len(POSITIONS) * n_layers} "
+              f"points already complete")
     rows = []
     for pos in POSITIONS:
         for L in range(n_layers):
+            key = f"{pos}:{L}"
+            if key in prev:
+                rows.append({"position": pos, "layer": L, "auc": prev[key]["auc"]})
+                continue
             oof, _ = oof_fixed(X[pos][:, L, :].astype(np.float32), y, groups, folds)
-            rows.append({"position": pos, "layer": L, "auc": _auc(y, oof)})
+            row = {"position": pos, "layer": L, "auc": _auc(y, oof)}
+            rows.append(row)
+            _ckpt_append(CKPT_CURVE, {**row, "fp": fp, "key": key})
         print(f"  {pos}: done")
     return pd.DataFrame(rows)
 
@@ -603,8 +668,9 @@ def phase_tests():
           f"(with spouse: {d_wr:+.4f})")
 
     # ---- C2 / C4 need the activations back ---------------------------------------------
-    X, y2, g2, rel2, _, _, _ = build_matrix()
+    X, y2, g2, rel2, _, _, q2 = build_matrix()
     assert len(y2) == len(y) and (y2 == y).all(), "row set drifted between phases"
+    assert (q2 == qids).all(), "row ORDER drifted between phases"
     folds = group_folds(g2)
 
     print("\n" + "=" * 78)
@@ -619,7 +685,7 @@ def phase_tests():
     print("\n" + "=" * 78)
     print("C4. READ POSITION x LAYER")
     print("=" * 78)
-    d4 = position_curves(X, y, g2, folds)
+    d4 = position_curves(X, y, g2, folds, _fingerprint(q2))
     piv = d4.pivot(index="layer", columns="position", values="auc")
     print(piv.round(4).to_string())
     for pos in POSITIONS:
