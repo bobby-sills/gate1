@@ -182,9 +182,9 @@ matching is exactly zero, against 0.457 unmatched (0 means identical, 1 means co
 different; random sampling noise alone produces about 0.07 at these sizes, which is why
 "zero" here means matching worked rather than that nothing was wrong).
 
-The unmatched version was kept and is being run separately as a sensitivity check. If the
-two disagree, that disagreement is a result in itself and gets reported, not resolved by
-picking the nicer one.
+The unmatched version was kept and run separately as a sensitivity check, with both
+registered in advance as primary and secondary so neither could be picked after the fact.
+It is reported in §11, and it produced a surprise.
 
 ---
 
