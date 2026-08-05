@@ -290,6 +290,7 @@ def group_folds(groups, n_folds=N_FOLDS, seed=SEED):
 
 CKPT_FOLDS = "probe_folds_ckpt.jsonl"
 CKPT_CURVE = "c4_curve_ckpt.jsonl"
+CKPT_LORO = "c2_loro_ckpt.jsonl"
 
 
 def _fingerprint(qids) -> str:
@@ -593,19 +594,33 @@ def _print_within(d, means, excluded, title):
                   f"known={r['known_rate']:.1%}")
 
 
-def leave_one_relation_out(X, y, groups, rel):
+def leave_one_relation_out(X, y, groups, rel, fp):
     """C2. Train on every relation but one, test on the held-out relation.
 
     Layer, position and C are selected inside the training relations only -- selecting
     them with the held-out relation visible would answer a different question than "does
     this transfer".
+
+    RESUMABLE per held-out relation. This is the most expensive test in the file -- one
+    full nested selection per relation, 264 fits each, ~2100 in total, which is more than
+    phase_train does.
     """
     out = []
     n_layers = X["final"].shape[1]
+    prev = _ckpt_load(CKPT_LORO, fp)
+    if prev:
+        print(f"  resuming {CKPT_LORO}: {len(prev)} relations already complete")
     for r in sorted(set(rel)):
         te = np.where(rel == r)[0]
         tr = np.where(rel != r)[0]
         if len(te) < MIN_RELATION_N or min(y[te].sum(), (1 - y[te]).sum()) < MIN_MINORITY_N:
+            continue
+        if r in prev:
+            row = {k: prev[r][k] for k in
+                   ("relation", "n", "known_rate", "position", "layer", "C", "auc")}
+            out.append(row)
+            print(f"  {r:<28} n={row['n']:<5} {row['position']} L{row['layer']:<3} "
+                  f"AUC={row['auc']:.4f}  (checkpoint)")
             continue
         itr, iva = _inner_split(tr, groups, SEED)
         best, best_auc = None, -np.inf
@@ -619,9 +634,11 @@ def leave_one_relation_out(X, y, groups, rel):
         pos, L, C = best
         Xl = X[pos][:, L, :].astype(np.float32)
         s = _fit_predict(Xl[tr], y[tr], Xl[te], C)
-        out.append({"relation": r, "n": len(te), "known_rate": float(y[te].mean()),
-                    "position": pos, "layer": int(L), "C": C, "auc": _auc(y[te], s)})
-        print(f"  {r:<28} n={len(te):<5} {pos} L{L:<3} AUC={out[-1]['auc']:.4f}")
+        row = {"relation": r, "n": int(len(te)), "known_rate": float(y[te].mean()),
+               "position": pos, "layer": int(L), "C": C, "auc": _auc(y[te], s)}
+        out.append(row)
+        _ckpt_append(CKPT_LORO, {**row, "fp": fp, "key": r})
+        print(f"  {r:<28} n={len(te):<5} {pos} L{L:<3} AUC={row['auc']:.4f}")
     return pd.DataFrame(out)
 
 
@@ -702,7 +719,7 @@ def phase_tests():
     print("\n" + "=" * 78)
     print("C2. LEAVE-ONE-RELATION-OUT")
     print("=" * 78)
-    d2 = leave_one_relation_out(X, y, groups, rel)
+    d2 = leave_one_relation_out(X, y, groups, rel, _fingerprint(q2))
     if len(d2):
         print(f"  n-weighted mean AUC = "
               f"{np.average(d2.auc, weights=d2.n):.4f}   "
@@ -841,6 +858,7 @@ if __name__ == "__main__":
         CALIB_FILE = "calibration_wide.json"
         CKPT_FOLDS = "probe_folds_ckpt_wide.jsonl"
         CKPT_CURVE = "c4_curve_ckpt_wide.jsonl"
+        CKPT_LORO = "c2_loro_ckpt_wide.jsonl"
         print(f"SECONDARY (POST-HOC) RUN: C_GRID = {C_GRID}")
         print(f"  -> {FOLDS_FILE}, {OOF_FILE}")
         print("  Declared sensitivity analysis. The pre-registered result is the "

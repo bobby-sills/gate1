@@ -241,6 +241,19 @@ check("c1_within_relation" in res and len(res["c1_within_relation"]) >= 2,
 excl = [r["relation"] for r in res["c1_excluded"]]
 check("currency" in excl, "single-class relation 'currency' excluded from C1, not scored")
 check(len(res["c2_loro"]) >= 2, f"C2 ran on {len(res['c2_loro'])} relations")
+# C2 is the most expensive test in the file -- one full nested selection per relation --
+# so its checkpoint matters as much as the fold one.
+ck2 = gate1.read_jsonl(gate2.CKPT_LORO)
+check(len(ck2) == len(res["c2_loro"]), f"C2 checkpointed {len(ck2)} relations")
+ck4 = gate1.read_jsonl(gate2.CKPT_CURVE)
+check(len(ck4) == 2 * N_LAYERS, f"C4 checkpointed {len(ck4)} curve points")
+gate2.phase_tests()                                   # second run, C2 + C4 fully resumed
+res2 = json.load(open(gate1._path(gate2.RESULTS_FILE)))
+check([r["auc"] for r in res2["c2_loro"]] == [r["auc"] for r in res["c2_loro"]],
+      "resumed C2 reproduces every held-out AUC exactly")
+check([r["auc"] for r in res2["c4_positions"]] == [r["auc"] for r in res["c4_positions"]],
+      "resumed C4 reproduces the whole layer curve exactly")
+check(len(gate1.read_jsonl(gate2.CKPT_LORO)) == len(ck2), "C2 resume refit nothing")
 check(len(res["c4_positions"]) == 2 * N_LAYERS, "C4 curve covers both positions x layers")
 best = max(res["c4_positions"], key=lambda r: r["auc"])
 check(best["position"] == SIGNAL_POS and best["layer"] == SIGNAL_LAYER,
