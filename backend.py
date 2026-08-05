@@ -18,6 +18,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -784,3 +785,107 @@ def next_token_distributions(
     _CACHE.last = (lp_theta, lp_ctx)
     _CACHE.stats["forward_steps"] += 1
     return _CACHE.last
+
+
+# ======================================================================================
+# 5. GATE 2 -- RESIDUAL-STREAM EXTRACTION  (see GATE2_PROTOCOL.md Phase A)
+# ======================================================================================
+
+# Wikidata labels carry disambiguating parentheticals the question drops:
+# "Shaft (2019 film)" appears as "the film Shaft (2019)". Stripping a single trailing
+# parenthetical recovers 7.6% of the pool on top of the 91.5% that match verbatim.
+_TRAILING_PAREN = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _subject_char_span(prompt: str, question: str, subject: str):
+    """Character span of `subject` inside the QUESTION LINE of `prompt`.
+
+    Scoped to the question line on purpose: the subject string can also occur in the
+    system block or, in the with-document rendering, in the passage. Position (2) is
+    defined as the entity mention the question is asking about, so an earlier incidental
+    occurrence is the wrong token.
+
+    Returns (start, end, tier) or (None, None, "unresolved"). `tier` is recorded per
+    question -- GATE2_PROTOCOL Phase A reports the mix, because a sudden shift toward the
+    looser tiers is how a tokenizer or template change would show up.
+    """
+    base = prompt.rfind(question)
+    if base < 0 or not subject:
+        return None, None, "unresolved"
+    line = prompt[base:base + len(question)]
+
+    stripped = _TRAILING_PAREN.sub("", subject).strip()
+    for cand, tier in ((subject, "verbatim"), (stripped, "paren-stripped")):
+        if cand and (i := line.find(cand)) >= 0:
+            return base + i, base + i + len(cand), tier
+    if stripped and (i := line.lower().find(stripped.lower())) >= 0:
+        return base + i, base + i + len(stripped), "casefold"
+    return None, None, "unresolved"
+
+
+def hidden_states(question: str, subject: str | None = None) -> dict:
+    """Context-free forward pass capturing the residual stream at EVERY layer.
+
+    Returns
+        h_final    float16 [n_layers, hidden] -- final question token, pre-generation
+        h_subject  float16 [n_layers, hidden] or None -- last token of the subject span
+        entropy    float   next-token entropy in nats, full vocabulary
+        max_prob   float   next-token max probability
+        span_tier  str     how the subject span was located; "unresolved" -> h_subject None
+        n_tokens   int     prompt length in tokens
+
+    THIS IS A THIRD FORWARD PASS. It does not reuse and must not be merged into
+    sample_closed_book or deterministic_features. Gate 1 invariant #2 forbids merging the
+    label pass with the predictor pass because sharing computation between them handicaps
+    the entropy baseline; this pass runs after both are on disk and shares computation
+    with neither, so it cannot move a label or a baseline. See GATE2_PROTOCOL.md Phase A.
+
+    `entropy` and `max_prob` come out of this pass for free and are NOT used downstream as
+    features -- gate2 reads those from labels.jsonl. They are returned so gate2 can check
+    them against labels.jsonl, which is a byte-level proof that the extraction prompt is
+    the Phase 2 prompt. That check is stronger than re-reading prompt_parity.txt, and it
+    costs one softmax.
+    """
+    import torch
+
+    tok, model = _load()
+    prompt = _build_prompt(question, None)              # None -> closed book, as Phase 2
+    enc = tok(prompt, return_tensors="pt", add_special_tokens=False,
+              return_offsets_mapping=True)
+    offsets = enc.pop("offset_mapping")[0].tolist()
+    ids = enc.input_ids.to(model.device)
+
+    with torch.inference_mode():
+        out = model(ids, output_hidden_states=True)
+
+    logits = out.logits[0, -1, :].float()
+    logp = torch.log_softmax(logits, dim=-1)
+    p = logp.exp()
+
+    # hidden_states is a tuple of length n_layers+1: embeddings, then one per block.
+    # The embedding layer is kept -- it is the null control for the C4 depth curve, and a
+    # probe that reads at layer 0 is reading the tokenizer, not the model.
+    hs = torch.stack([h[0] for h in out.hidden_states])  # [n_layers, seq, hidden]
+
+    start, end, tier = (None, None, "no-subject")
+    if subject is not None:
+        start, end, tier = _subject_char_span(prompt, question, subject)
+
+    h_subject = None
+    if start is not None:
+        # LAST token overlapping the span. Llama's BPE splits entity names across several
+        # tokens and the entity representation is assembled at the final one.
+        hit = [i for i, (a, b) in enumerate(offsets) if a < end and b > start]
+        if hit:
+            h_subject = hs[:, hit[-1], :].float().cpu().numpy().astype("float16")
+        else:
+            tier = "unresolved"                          # span fell in a zero-width offset
+
+    return {
+        "h_final": hs[:, -1, :].float().cpu().numpy().astype("float16"),
+        "h_subject": h_subject,
+        "entropy": float(-(p * logp).sum()),
+        "max_prob": float(p.max()),
+        "span_tier": tier,
+        "n_tokens": int(ids.shape[1]),
+    }
