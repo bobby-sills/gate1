@@ -991,6 +991,22 @@ def answer_states(question: str, max_new_tokens: int = MAX_NEW_TOKENS) -> dict:
     logits = out.logits[0, n - 1:n + m, :].float()        # [m+1, V]
     ent, mx, logp = _entropies(logits)
 
+    # ---- the parity pair comes from its OWN prompt-only pass -------------------------
+    # CORRECTED 2026-08-05. GATE2B_PROTOCOL originally said slice index 0 above "is exactly
+    # deterministic_features". True in exact arithmetic, FALSE in bf16: fused attention
+    # kernels are selected by sequence length, so position n-1 inside a length-(n+m) pass
+    # is not bitwise a length-n pass. Measured on the L4 pool: median 1.19e-7 but 3.50e-1
+    # at the tail, which fired the registered STOP on a quantity that was not what the
+    # protocol claimed it was.
+    #
+    # The parity pair exists ONLY to prove the extraction prompt is the Phase 2 prompt, so
+    # it must be computed the way Phase 2 computed it. One extra forward pass, ~0.09s.
+    # Everything else on this row -- b2, b3, and all three activation reads -- still comes
+    # from the teacher-forced pass above, where those positions are defined.
+    with torch.inference_mode():
+        p_logits = model(ids).logits[0, -1, :].float()
+    p_ent, p_mx, _ = _entropies(p_logits.unsqueeze(0))
+
     tgt = torch.tensor(core, device=logits.device)
     tok_logp = logp[:m].gather(1, tgt.unsqueeze(1)).squeeze(1)   # log p(a_j), j=1..m
 
@@ -1003,11 +1019,18 @@ def answer_states(question: str, max_new_tokens: int = MAX_NEW_TOKENS) -> dict:
         "h_mean": h(hs[:, n:n + m, :].mean(dim=1)),
         "answer": tok.decode(core, skip_special_tokens=True).strip(),
         "n_answer_tokens": int(m),
-        # The parity pair: recomputed at the final QUESTION token, so it must reproduce
-        # what labels.jsonl holds. b1 itself is read from labels.jsonl, not from here.
-        "entropy": float(ent[0]),
-        "max_prob": float(mx[0]),
-        "first_token_is_argmax": bool(int(logits[0].argmax()) == core[0]),
+        # The parity pair, from the prompt-only pass: it must reproduce labels.jsonl
+        # BITWISE on the Phase 2 hardware. b1 itself is read from labels.jsonl, not here.
+        "entropy": float(p_ent[0]),
+        "max_prob": float(p_mx[0]),
+        # What the teacher-forced pass gave at the same position, kept for diagnosis: the
+        # gap between these two IS the sequence-length kernel effect, per question.
+        "entropy_teacher_forced": float(ent[0]),
+        # Against the PROMPT-ONLY logits, not the teacher-forced ones. generate() decodes
+        # the first token from a prompt-only forward, so that is the distribution this
+        # assertion is about; comparing to the teacher-forced slice measured the kernel
+        # effect instead and read 99.39% when the claim it tests is exactly true.
+        "first_token_is_argmax": bool(int(p_logits.argmax()) == core[0]),
         # b2 at each read position. b2_first is one token PAST b1 and must not equal it.
         "b2_first": float(ent[1]) if m >= 1 else float("nan"),
         "b2_last": float(ent[m]),

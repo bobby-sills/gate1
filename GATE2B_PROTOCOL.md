@@ -181,9 +181,35 @@ the three positions are not really three positions.
 
 ### Parity check
 
-The teacher-forced pass recomputes the distribution at `t_n` for free, which is exactly
-`deterministic_features`. Compare `(entropy, max_prob)` against `labels.jsonl` on the same
-three-tier tolerance Gate 2 registered:
+> **CORRECTION, 2026-08-05, after Phase A ran.** The sentence below — "the teacher-forced
+> pass recomputes the distribution at `t_n` for free, which is exactly
+> `deterministic_features`" — is **true in exact arithmetic and false in bf16**. Fused
+> attention kernels are selected by sequence length, so reading position `n−1` inside a
+> length-`n+m` pass is not bitwise identical to a length-`n` pass. The registered check was
+> therefore comparing a quantity that is not what this protocol claimed it was: on the L4
+> re-run it gave median 1.19e-7 with 560/1793 exact and a tail to 3.50e-1, and it fired the
+> STOP.
+>
+> **The parity pair must come from a SEPARATE prompt-only forward pass** — the code path
+> Phase 2 actually ran. `backend.answer_states` is fixed accordingly for future runs. The
+> Phase A shards of 2026-08-05 predate the fix and store the teacher-forced value; they
+> were **not** re-extracted, because the recomputed pair is diagnostic only — b1 is read
+> from `labels.jsonl` and no experimental quantity depends on it.
+>
+> Parity for those shards is established instead by three independent checks, each
+> **1793/1793**:
+>
+> | check | result |
+> |---|---|
+> | prompt string == `render_prompts(...)[0]` | 1793 / 1793 |
+> | prompt-only pass vs `labels.jsonl`, entropy **and** max_prob | 1793 / 1793 **bitwise**, max 0.00e+00 |
+> | regenerated `n_correct` vs `labels.jsonl` | 1793 / 1793 |
+>
+> Prompt and hardware are proven identical to Phase 2. A prior A100 run failed all of
+> these and was discarded; see *Hardware*.
+
+Compare `(entropy, max_prob)` against `labels.jsonl` on the same three-tier tolerance
+Gate 2 registered:
 
 | max abs difference in entropy | reading |
 |---|---|
@@ -305,6 +331,85 @@ is advantaged by an easier subset.
 **DeLong is secondary**: it assumes two scores on one fixed test set from models that did
 not vary, which pooled out-of-fold CV predictions violate. Where they disagree, the
 bootstrap governs and the disagreement is reported.
+
+---
+
+## Pre-committed interpretation of Phase B
+
+**LOCKED 2026-08-05 by the human, after Checkpoint A and BEFORE the probe was trained.**
+Written down now so that a passing number cannot be reinterpreted after it exists.
+
+BEST baseline is **b1 = 0.8598**, so the pre-registered bar is **probe ≥ 0.8898 pooled**
+with an entity-clustered CI excluding 0, plus the C1 within-relation veto.
+
+**If the probe FAILS the bar.** The result is clean and it converges with Gate 2 *from the
+opposite direction*: two independent read positions, the same verdict. Report it as such.
+
+**If the probe PASSES the bar.** It is **not** interpretable as knowledge detection,
+because C0 cannot rule out the greedy-correctness shortcut (below). The finding is then:
+
+> A probe at answer tokens predicts the knowledge label, confounded with generation
+> correctness, unresolvable on this data.
+
+**Do not claim knowledge detection on this data**, whatever the number.
+
+### Two findings to report regardless of outcome
+
+**1. Entropy degrades at answer tokens.** Measured at Checkpoint A, before any probe was
+trained:
+
+| position | AUC |
+|---|---|
+| `H(p_theta)` at the question-final token (b1) | **0.8598** |
+| mean over the answer span (b2, p3) | 0.7831 |
+| first answer token (b2, p1) | 0.7418 |
+| last answer token (b2, p2) | 0.7344 |
+
+The Orgad-based motivation predicts the truthfulness signal concentrates at the exact
+answer tokens. On this task and this label it does not — the free signal is *strongest*
+where Gate 2 already read it and loses 8–13 AUC points when moved. That is half of Gate
+2b's question answered before training, and it belongs in the write-up independently of
+what the probe does.
+
+**2. C0 is unevaluable, and why.** Greedy correctness separates the knowledge label at
+≈0.986 AUC, so the stratification C0 depends on collapses:
+
+| stratum | n | known | unknown | minority | reportable (floor 10) |
+|---|---|---|---|---|---|
+| greedy correct | 984 | 969 | 15 | 15 | yes |
+| greedy incorrect | 598 | **3** | 595 | **3** | **no** |
+
+The incorrect-generation subset — "where a knowledge signal would have to do real work" —
+holds three known rows. The test designed to separate *"the model knows this fact"* from
+*"this generated answer happens to be right"* has no evidence base on this data. **Report
+the strata table**, rather than hiding behind the floor rule: it shows the design's limit
+honestly. This is the reason a passing probe cannot be read as knowledge detection.
+
+---
+
+## Hardware
+
+**Registered 2026-08-05, after it cost a full extraction.** Phase 2's `labels.jsonl` and
+Gate 2's extraction ran on an **L4**. Gate 2b's Phase A must run on the same architecture.
+
+A first Phase A ran on an A100 and failed two registered STOP conditions with a
+byte-identical prompt:
+
+| measurement | A100 | L4 |
+|---|---|---|
+| `deterministic_features` vs `labels.jsonl` | median 1.272e-2, **0/200** exact | **1793/1793** exact |
+| regenerated `n_correct` vs `labels.jsonl` | 1283/1793 (510 mismatches) | **1793/1793** |
+
+Sampling amplifies bit-level logit differences into different token choices, so b4's
+registered guarantee — *the identical ten label-producing strings* — does not survive a
+change of GPU architecture. The A100 shards were discarded.
+
+**The numeric parity check only verifies the prompt within one GPU architecture.** Across
+architectures it cannot separate "the prompt changed" from "the kernels changed". The
+**string-level check is the one that carries the prompt-identity claim**, and it runs in
+Checkpoint A from now on. Gate 2 read 0.00e+00 as proof its prompt was byte-identical;
+that happened to be true, but the check could not have distinguished it from a hardware
+match.
 
 ---
 
