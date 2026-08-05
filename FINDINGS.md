@@ -1,7 +1,7 @@
 # Gate 1 — findings
 
-Status as of 2026-08-04. The primary run is complete. A secondary run is still
-decoding; the section that needs it is marked unfinished.
+Status as of 2026-08-04. Both the primary and the secondary run are complete. Gate 2 has
+not been started.
 
 ---
 
@@ -51,6 +51,10 @@ Two things qualify it, both quantified in §7: about a third of the advantage in
 the two situations we care about comes from a lenient scoring rule rather than from
 better answers, and the whole result covers a narrower slice of facts than originally
 planned.
+
+A second, deliberately less careful version of the same experiment reaches the same
+conclusion with a smaller margin (§11) — which turned out to be the opposite of what we
+expected, for a reason worth reading.
 
 ---
 
@@ -345,18 +349,73 @@ of method settings.
 
 ---
 
-## 11. Not yet done
+## 11. The secondary run, and a surprise in it
 
-The secondary unmatched run is still generating. When it finishes, this document needs:
+The unmatched version — the two groups left with their natural, differing mixes of
+relationships — was run end to end as a check. It reaches the **same conclusion**:
 
-- the same table as §6 for the unmatched version, and
-- the difference between the two, which measures how much confounding the matching removed
+```
+matched (primary)      cheating - confidence = +13.83   (range +11.01 to +16.80)
+unmatched (secondary)  cheating - confidence = +10.33   (range  +7.65 to +13.02)
+```
 
-Gate 2 has not been started and should not be until the above is read.
+We expected the unmatched gap to be *larger*, on the reasoning that the difficulty
+mismatch would inflate the apparent advantage. **It is smaller.** The mismatch was
+working against the cheating method, not for it.
+
+The cause is visible, and it is not the cheating method changing:
+
+```
+resistance situation    matched   unmatched
+  cheating method          99.7        99.7   <- unchanged, already at the ceiling
+  confidence               87.0        91.3   <- baseline improves by 4.3
+  fixed                    76.7        84.0   <- baseline improves by 7.3
+```
+
+Left unmatched, the resistance situation is filled from the natural pool of facts the
+model happens to know — which is loaded with easy relationships (`country of citizenship`
+is 50 of the 300, `sport` 47). Easy for the cheating method, but easy for a confidence
+signal too. Matching removes that free lift, the baselines fall back, and the measured gap
+grows.
+
+**This should not be over-read.** The two ranges overlap between 11.01 and 13.02, so the
+3.5-point difference is not statistically established. The two runs also use different
+question sets — 600 each, sharing only 241 — so no paired comparison is possible and some
+of the difference is ordinary sampling variation. What holds up is the direction and the
+mechanism behind it, not the size.
+
+The §7 test also holds in both, though less sharply unmatched:
+
+```
+                   where they disagree   where they agree
+matched                          +42.1               +3.2
+unmatched                        +20.7               +6.1
+```
+
+The weakening is structural rather than contradictory. Unmatched, the resistance situation
+contains only **12** questions of the "sounds unsure but does know" kind, against 82 when
+matched. The natural distribution barely contains the disagreement cases the explanation
+depends on, so there is less room to demonstrate it. That is a further argument that the
+matched design is the better instrument, not a reason to doubt the finding.
+
+The scoring-rule effect from §7 replicates too: the cheating method loses 7.3–8.3 points
+under strict scoring against 2.3–3.0 for every other method, and its advantage on
+correction falls from +12.3 to +7.0.
 
 ---
 
-## 12. Where everything lives
+## 12. Not yet done
+
+Gate 2 has not been started and should not be until the above has been read.
+
+Two smaller loose ends: the strict-scoring adjustment in §7 is arithmetic on two averages
+rather than a full re-run of the resampling, and the printed outputs of the decision and
+breakdown programs are not yet saved to files (they are reproducible on an ordinary CPU,
+since nothing in them is random).
+
+---
+
+## 13. Where everything lives
 
 | file | what it is |
 |---|---|
