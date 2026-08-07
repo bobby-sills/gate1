@@ -1038,3 +1038,132 @@ def answer_states(question: str, max_new_tokens: int = MAX_NEW_TOKENS) -> dict:
         "b3_mean_logprob": float(tok_logp.mean()),
         "n_tokens": int(n),
     }
+
+
+# ======================================================================================
+# 7. GATE 3a -- CANDIDATE-ANSWER VERIFICATION  (see GATE3_PROTOCOL.md)
+# ======================================================================================
+#
+# Gate 3a changes the unit from "question" to "(question, candidate answer)". Everything
+# here scores a SPECIFIC candidate the caller supplies, rather than one the model just
+# generated -- which is what makes gold injection possible, and gold injection is the only
+# route to answers the model never produces (Inside-Out needed it in 64% of cases).
+
+CAND_TEMPERATURE = 1.0               # GATE3_PROTOCOL Phase A. NOT sample_closed_book's 0.7.
+LAYER_LO, LAYER_HI = 10, 25          # inclusive; registered before any Gate 3a data existed
+
+
+def sample_candidates(question: str, n: int, seed: int,
+                      temperature: float = CAND_TEMPERATURE) -> list[str]:
+    """n candidate answers at T=1.0. A SEPARATE function from sample_closed_book on purpose.
+
+    sample_closed_book is pinned to TEMPERATURE=0.7 by PROTOCOL 2.1 and its outputs are the
+    Gate 1 knowledge labels; changing its temperature would silently invalidate labels.jsonl
+    and every gate built on it. Gate 3a wants a broader candidate pool, so it gets its own
+    entry point and its own seed derivation.
+    """
+    import torch
+
+    tok, model = _load()
+    ids = _encode(_build_prompt(question, None))
+    # Distinct seed stream from sample_closed_book, so Gate 3a candidates are not a
+    # superset-by-accident of the ten label-producing samples.
+    torch.manual_seed(_question_seed(question, seed) ^ 0x3A)
+
+    with torch.inference_mode():
+        out = model.generate(ids, do_sample=True, temperature=temperature,
+                             top_p=1.0, top_k=0, num_return_sequences=n,
+                             max_new_tokens=MAX_NEW_TOKENS, pad_token_id=tok.eos_token_id)
+    return [tok.decode(s[ids.shape[1]:], skip_special_tokens=True).strip() for s in out]
+
+
+def candidate_states(question: str, answer: str,
+                     layer_lo: int = LAYER_LO, layer_hi: int = LAYER_HI) -> dict | None:
+    """Teacher-forced read over [prompt + THIS candidate answer].
+
+    Returns None when the candidate tokenizes to nothing.
+
+        h_mean     float16 [n_layers_kept, hidden] -- mean over the candidate's tokens
+        logp_sum   float   log P(a|q)
+        logp_mean  float   length-normalised, = Inside-Out's P_norm(a|q)
+
+    ONE read position, `mean`, and a 16-layer window. Both were fixed on evidence that
+    predates Gate 3a: Gate 2b's C4 measured mean-pooled beating last (0.9004 vs 0.8968) and
+    first (0.8697), and both C4 and Inside-Out A.5 put the useful depth in the middle of the
+    network. Storing three positions across 33 layers would be ~7GB for no measured gain.
+    Inside-Out likewise uses a single hidden state h_M(q, a).
+    """
+    import torch
+
+    tok, model = _load()
+    ids = _encode(_build_prompt(question, None))
+    n = ids.shape[1]
+
+    ans = tok(answer, add_special_tokens=False).input_ids
+    if not ans:
+        return None
+    m = len(ans)
+
+    full = torch.cat([ids, torch.tensor([ans], device=ids.device, dtype=ids.dtype)], dim=1)
+    with torch.inference_mode():
+        out = model(full, output_hidden_states=True)
+
+    hs = torch.stack([h[0] for h in out.hidden_states[layer_lo:layer_hi + 1]])
+
+    # log p(a_j) is produced at the position BEFORE a_j: a_1 at index n-1, a_m at n+m-2.
+    logits = out.logits[0, n - 1:n + m - 1, :].float()
+    logp = torch.log_softmax(logits, dim=-1)
+    tgt = torch.tensor(ans, device=logits.device)
+    tok_logp = logp.gather(1, tgt.unsqueeze(1)).squeeze(1)
+
+    return {
+        "h_mean": hs[:, n:n + m, :].mean(dim=1).float().cpu().numpy().astype("float16"),
+        "logp_sum": float(tok_logp.sum()),
+        "logp_mean": float(tok_logp.mean()),
+        "n_answer_tokens": int(m),
+    }
+
+
+_TRUE_IDS = None
+
+
+def p_true(question: str, answer: str) -> float:
+    """P("True") when the model is asked to verify the candidate. Inside-Out's strongest
+    external scorer, and the reason Llama's published hidden-knowledge gap is small.
+
+    Its own prompt and its own forward pass -- it is a different question put to the model,
+    not a re-reading of the generation pass. Probability mass is summed over the casing and
+    leading-space variants of "True" that Llama's BPE actually emits, then normalised
+    against the same treatment of "False", so the result is a proper two-way probability
+    rather than a raw token probability that varies with tokenizer quirks.
+    """
+    global _TRUE_IDS
+    import torch
+
+    tok, model = _load()
+    if _TRUE_IDS is None:
+        def variants(w):
+            out = set()
+            for s in (w, " " + w, w.lower(), " " + w.lower(), w.upper()):
+                t = tok(s, add_special_tokens=False).input_ids
+                if len(t) == 1:
+                    out.add(t[0])
+            return sorted(out)
+        _TRUE_IDS = (variants("True"), variants("False"))
+
+    user = (f"Question: {question}\nProposed answer: {answer}\n"
+            f"Is the proposed answer correct? Answer True or False.")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                     date_string=DATE_STRING)
+    ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
+
+    with torch.inference_mode():
+        logits = model(ids).logits[0, -1, :].float()
+    p = torch.softmax(logits, dim=-1)
+
+    t_ids, f_ids = _TRUE_IDS
+    pt = float(p[t_ids].sum())
+    pf = float(p[f_ids].sum())
+    return pt / (pt + pf) if (pt + pf) > 0 else 0.5

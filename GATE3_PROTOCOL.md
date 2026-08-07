@@ -206,9 +206,24 @@ advantage of this design and is noted as such.
 
 ## Invariants — do not "fix" these
 
-1. **The unit is (question, candidate answer), and K is computed WITHIN a question.** This
-   is what makes answer-identity and relation priors cancel. Any aggregation that compares
-   scores across questions reintroduces both leaks Gate 2b died of.
+1. **The unit is (question, candidate answer), and K is computed WITHIN a question.** Any
+   aggregation that compares scores across questions reintroduces the leaks Gate 2b died of.
+
+   > **CORRECTION, 2026-08-06, before any Gate 3a data existed.** As frozen, this invariant
+   > said K "makes answer-identity and relation priors cancel." **The answer-identity half
+   > is wrong**, and `selftest3` now checks both halves rather than asserting them:
+   >
+   > - **Cancels exactly.** Anything constant within a question — relation identity,
+   >   question difficulty, entity popularity, question wording. Every pair such a scorer
+   >   sees is a tie, so it scores exactly 0.5. Verified.
+   > - **Does NOT cancel.** Answer identity. The candidates within a question are
+   >   *different answer strings*, so a prior over answers still varies inside a pair and
+   >   can rank it — a fixture scorer using answer identity alone reaches K far from 0.5.
+   >
+   > The answer-identity leak — the one that killed Gate 2b — is therefore closed by the
+   > **subject- AND object-disjoint split** (invariant 5), not by the metric. Invariant 5
+   > is load-bearing, not belt-and-braces, and must not be relaxed if the fold builder
+   > struggles with low-cardinality relations.
 
 2. **Training pairs come from questions the model knows.** Training on all questions
    recreates the (A)/(D) conflation and the 3-row stratum. See Inside-Out §A.4.
