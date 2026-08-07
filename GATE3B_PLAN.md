@@ -20,7 +20,7 @@ entropy-gated arm. Nobody has shown that a *real* probe recovers a single point.
 Gate 3b: take the probe scores we already have, feed them into the decoder's gate as `k`,
 and measure faithfulness against the `entropy`, `max_prob` and `constant` arms.
 
-## THE KEY FINDING: this needs no GPU
+## ~~THE KEY FINDING: this needs no GPU~~ — WRONG, corrected 2026-08-07
 
 `gate1.tau_for` for every threshold arm is:
 
@@ -32,11 +32,34 @@ The decoder only ever sees `tau`. A threshold arm therefore emits values from
 `{tau0 - delta, tau0 + gamma}` over `TAU_GRID x GAMMA_GRID x DELTA_GRID` — **independent of
 which signal drives the threshold.**
 
-So a probe arm's `required_work` set is a **subset of the entropy arm's**, and every
-generation it needs is already in `generations.jsonl` from Gate 1's decode. Gate 3b is
-**pure CPU re-scoring**: look up cached generations, score with `alias_match`, aggregate.
+The claim drawn from that was: a probe arm's `required_work` is a subset of the entropy
+arm's, so Gate 3b is pure CPU re-scoring.
 
-Minutes, not hours. This is why it is the cheapest remaining experiment.
+**That is false, and `gate3b.py check` caught it before any number was computed.** The set
+of tau *values* is a subset. The set of **`(qid, tau)` pairs is not** — and the generation
+cache is keyed on the pair.
+
+A question whose entropy falls below all three entropy thresholds takes the `tau0 - delta`
+branch for *every* entropy config, so its `tau0 + gamma` generations were never produced.
+If the probe puts that question on the other side of its own threshold, it asks for exactly
+the generation no arm ever requested.
+
+```
+518 of 15600 units missing, on 74 of 600 questions
+  entropy below all 3 thresholds: 37     above all 3: 37
+  knowledge: known 37, unknown 37
+```
+
+**The 74 are not a random remainder.** They are precisely the questions where the probe
+disagrees with *both* entropy and the ground-truth knowledge label. That is the only
+population on which a probe can add anything Gate 1 did not already have — which is why
+they are missing, and why they must not be dropped. Dropping them would delete the
+experiment and leave a number that looked fine.
+
+**Revised cost: 518 decode units, 2.0% of Gate 1's 25,974.** Still the cheapest remaining
+experiment; just not free. `gate3b.py decode` fills them, resumably, writing to
+`generations_gate3b.jsonl` — a separate file, so Gate 1's reported artifact is not
+modified by a later gate's choices.
 
 ## Design
 
@@ -54,14 +77,22 @@ Minutes, not hours. This is why it is the cheapest remaining experiment.
 Write `gate3b.py` importing `gate1`; **do not edit `gate1.py`** (authorization-gated, and
 its constants are pre-registered).
 
-## Checks to run first
+## Checks to run first — all three now run as `gate3b.py check`
 
-- **Coverage.** Do all `cells.jsonl` qids have a probe score? `probe2b_oof` covers 1582
-  questions (FUNCTIONAL, non-discard, answer span resolved); cells should be a subset but
-  this is unverified. Any gap must be reported, not silently dropped.
-- **Cache hit rate.** Assert every required `(qid, context_kind, tau)` is present in
-  `generations.jsonl`. If any miss, the subset argument above is wrong and it needs
-  understanding before proceeding.
+- **Coverage.** Do all `cells.jsonl` qids have a probe score? **PASS** — all 600 cells
+  questions are inside `probe2b_oof`'s 1582.
+- **Cache hit rate.** **FAIL, and it was informative** — see the corrected section above.
+  `decode` closes it.
+- **Scoring reproduction** (added after the first two ran). Re-score gate 1's own
+  `entropy` arm from `cells.jsonl` + `generations.jsonl` and compare against `sweep.csv`
+  row by row. **PASS at 432000/432000, agreement 1.000000.** This is the only thing tying
+  this file's probe number to Gate 1's published baselines; without it a scoring
+  discrepancy would show up as a fake probe effect.
+
+  Note for anyone re-running it: `thr` must be rounded before use as a merge key.
+  `to_csv` truncates float64, so the middle entropy threshold round-trips as
+  `0.948013722896576` against an in-memory `0.9480137228965759`, and a third of the rows
+  silently fail to join at 100% agreement on the rest.
 
 ## What to expect
 
