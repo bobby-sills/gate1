@@ -109,11 +109,11 @@ def load_gens() -> dict:
     return gens
 
 
-def units_needed(cells: pd.DataFrame) -> set:
+def units_needed(cells: pd.DataFrame, arms=None) -> set:
     recs = cells.to_dict("records")
-    return {(r["qid"], r["context_kind"],
-             tau_for_probe(r, c["tau0"], c["gamma"], c["delta"], c["thr"]))
-            for c in build_probe_configs(cells) for r in recs}
+    cfgs = [c for c in build_new_configs(cells)
+            if arms is None or c["arm"] in arms]
+    return {(r["qid"], r["context_kind"], _tau(c, r)) for c in cfgs for r in recs}
 
 
 def attach_probe(cells: pd.DataFrame, scores: dict) -> pd.DataFrame:
@@ -161,18 +161,113 @@ def build_probe_configs(cells: pd.DataFrame) -> list:
     return cfgs
 
 
+# ======================================================================================
+# The conflict arm -- agreement between the two gates as an uncertainty signal
+# ======================================================================================
+#
+# ADDED 2026-08-07, AFTER seeing the probe arm's result. That ordering is a real hazard
+# and is declared: proposing an arm once you have looked at the data is how a result gets
+# manufactured. Two guards, both non-negotiable for this arm:
+#
+#   1. SPLIT-HALF IS THE HEADLINE, not the tuned number. `splithalf` selects on questions
+#      this arm never scored and measures on the rest.
+#   2. EQUAL TUNING BUDGET. See build_conflict_configs.
+#
+# The motivating measurement, from `diag` and the router-ceiling check:
+#
+#     gates AGREE     n=816   entropy 84.06   probe 84.86
+#     gates CONFLICT  n=384   entropy 68.18   probe 72.94
+#
+# When the two gates disagree BOTH arms lose ~15 points. Conflict predicts difficulty,
+# not which arm to trust -- on the disagreements entropy matches the knowledge label 55%
+# of the time and the probe 45%, so routing to the "better" arm is a coin flip. What is
+# NOT ruled out is treating conflict as its own state and hedging there.
+#
+# Why this is not capped by the +5.67 perfect-router ceiling: that ceiling bounds any
+# choice BETWEEN the two arms' existing outputs. A three-state rule emits a tau neither
+# arm visits, so it is not a selection among their outputs.
+
+
+def tau_for_conflict(row, tau0: float, gamma: float, delta: float,
+                     thr_p: float, thr_e: float) -> float:
+    """Three states instead of two.
+
+        both gates say known    -> tau0 - delta   (pull back toward memory)
+        both gates say unknown  -> tau0 + gamma   (push toward the document)
+        the gates disagree      -> tau0           (hedge; commit to neither)
+
+    The hedge is tau0 exactly, not a separately tuned value. Tuning the hedge would add
+    a fourth grid dimension and hand this arm a budget no other arm has. tau0 is the
+    natural neutral point and is what the `constant` arm uses.
+    """
+    known_p = row["probe"] > thr_p
+    known_e = row["entropy"] < thr_e
+    if known_p != known_e:
+        t = tau0
+    elif known_p:
+        t = tau0 - delta
+    else:
+        t = tau0 + gamma
+    return round(float(np.clip(t, TAU_MIN, TAU_MAX)), 3)
+
+
+def build_conflict_configs(cells: pd.DataFrame) -> list:
+    """8 x 5 x 3 x 3 = 360 configs, the same as every other threshold arm.
+
+    THE BUDGET PROBLEM. This arm reads two signals, so it naturally wants a probe
+    threshold AND an entropy threshold -- 3 x 3 = 9 combinations against everyone else's
+    3. That is a 3x tuning advantage and it would break gate1 invariant 5, which exists
+    because unequal tuning is the standard way "adaptive beats fixed" turns out to be an
+    artifact.
+
+    So the two thresholds are PAIRED at the same quantile level: (q25, q25), (q50, q50),
+    (q75, q75). Three combinations. Beyond fixing the budget this is the coupling that
+    makes sense -- it holds both gates at the same strictness, so "they disagree" means
+    the signals disagree rather than one gate simply being set looser than the other.
+
+    `thr` in the emitted config is the QUANTILE LEVEL, so the groupby keys stay
+    one-dimensional and `select`/`rows_at` work unchanged. The realised threshold values
+    ride along as thr_p/thr_e and are not part of the key.
+    """
+    qs = [0.25, 0.5, 0.75]
+    thr_p = list(np.quantile(cells.probe, qs))
+    thr_e = list(np.quantile(cells.entropy, qs))
+    cfgs = [{"arm": "conflict", "tau0": t, "gamma": g, "delta": d, "thr": q,
+             "thr_p": p, "thr_e": e}
+            for t in TAU_GRID for g in GAMMA_GRID for d in DELTA_GRID
+            for q, p, e in zip(qs, thr_p, thr_e)]
+    assert len(cfgs) == N_EXPECTED_CFGS, (len(cfgs), N_EXPECTED_CFGS)
+    return cfgs
+
+
+# arm name -> (config builder, tau function taking (row, **cfg-minus-arm/thr))
+NEW_ARMS = ("probe", "conflict")
+
+
+def _tau(cfg: dict, row) -> float:
+    if cfg["arm"] == "probe":
+        return tau_for_probe(row, cfg["tau0"], cfg["gamma"], cfg["delta"], cfg["thr"])
+    return tau_for_conflict(row, cfg["tau0"], cfg["gamma"], cfg["delta"],
+                            cfg["thr_p"], cfg["thr_e"])
+
+
+def build_new_configs(cells: pd.DataFrame) -> list:
+    return build_probe_configs(cells) + build_conflict_configs(cells)
+
+
 def sweep_probe(cells: pd.DataFrame, gens: dict) -> pd.DataFrame:
     """Score every probe config against the CACHED generations. Pure CPU."""
-    cfgs = build_probe_configs(cells)
     recs, misses = [], []
-    for c in cfgs:
+    for c in build_new_configs(cells):
         for r in cells.to_dict("records"):
-            tau = tau_for_probe(r, c["tau0"], c["gamma"], c["delta"], c["thr"])
+            tau = _tau(c, r)
             g = gens.get((r["qid"], r["context_kind"], tau))
             if g is None:
                 misses.append((r["qid"], r["context_kind"], tau))
                 continue
-            recs.append({**c, "qid": r["qid"], "cell": r["cell"],
+            recs.append({"arm": c["arm"], "tau0": c["tau0"], "gamma": c["gamma"],
+                         "delta": c["delta"], "thr": c["thr"],
+                         "qid": r["qid"], "cell": r["cell"],
                          "correct": alias_match(g["text"], r["target_aliases"]),
                          "n_chars": g["n_chars"]})
     if misses:
@@ -313,7 +408,7 @@ def phase_decode(unmatched: bool = False):
     cells = attach_probe(load_cells(unmatched), load_probe())
     gens = load_gens()
     todo = sorted(units_needed(cells) - set(gens))
-    print(f"probe arm needs {len(units_needed(cells))} units; "
+    print(f"new arms need {len(units_needed(cells))} units; "
           f"{len(gens)} cached; resuming with {len(todo)} to decode")
     if not todo:
         print("nothing to do.")
@@ -357,13 +452,16 @@ def phase_check(unmatched: bool = False):
     print("=" * 78)
     print("2. CACHE HIT RATE -- is the probe arm's work really a subset of entropy's?")
     print("=" * 78)
+    for arm in NEW_ARMS:
+        n = units_needed(cells, arms={arm})
+        m = n - set(gens)
+        print(f"  {arm:<10} {len(build_probe_configs(cells))} configs   "
+              f"{len(n):5d} units   {len(m):4d} missing")
     need = units_needed(cells)
     miss = need - set(gens)
-    print(f"  probe configs            {len(build_probe_configs(cells))}  (entropy has "
-          f"{len(TAU_GRID) * len(GAMMA_GRID) * len(DELTA_GRID) * 3} -- equal budget)")
-    print(f"  distinct decode units    {len(need)}")
-    print(f"  already cached           {len(need) - len(miss)}")
-    print(f"  MISSING                  {len(miss)}")
+    print(f"  {'union':<10} {2 * N_EXPECTED_CFGS} configs   "
+          f"{len(need):5d} units   {len(miss):4d} missing")
+    print(f"  (every arm gets {N_EXPECTED_CFGS} configs -- equal budget, invariant 5)")
     if miss:
         mq = {k[0] for k in miss}
         d = cells.drop_duplicates("qid").set_index("qid")
@@ -439,7 +537,7 @@ def phase_score(unmatched: bool = False):
     ref = pd.read_csv(_path("sweep_unmatched.csv" if unmatched else "sweep.csv"))
     sweep = pd.concat([ref, probe_sweep], ignore_index=True)
 
-    arms = [a for a in ("constant", "entropy", "max_prob", "probe",
+    arms = [a for a in ("constant", "entropy", "max_prob", "probe", "conflict",
                         "oracle_one_sided", "oracle_two_sided") if a in set(sweep.arm)]
     pts, cfg = {}, {}
     for a in arms:
@@ -464,25 +562,39 @@ def phase_score(unmatched: bool = False):
     print("=" * 78)
     print("PAIRED BOOTSTRAP -- resampled by qid, 95% CI")
     print("=" * 78)
-    for base in ("entropy", "max_prob", "constant"):
-        if base not in pts:
+    for new in NEW_ARMS:
+        if new not in pts:
             continue
-        d, lo, hi = compare(pts["probe"], pts[base])
+        for base in ("entropy", "max_prob", "constant"):
+            if base not in pts:
+                continue
+            d, lo, hi = compare(pts[new], pts[base])
+            star = "" if lo > 0 or hi < 0 else "   (CI spans zero)"
+            print(f"  {new} - {base:<16}{d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]{star}")
+        print()
+    if "conflict" in pts and "probe" in pts:
+        d, lo, hi = compare(pts["conflict"], pts["probe"])
         star = "" if lo > 0 or hi < 0 else "   (CI spans zero)"
-        print(f"  probe - {base:<16}{d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]{star}")
+        print(f"  conflict - probe        {d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]{star}")
+        print()
 
     if oracle:
         d, lo, hi = compare(pts[oracle], pts["entropy"])
-        dp, lop, hip = compare(pts[oracle], pts["probe"])
-        print()
         print(f"  {oracle} - entropy   {d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]"
               f"   <- Gate 1's headroom, recomputed here")
-        print(f"  {oracle} - probe     {dp:+7.2f}  [{lop:+.2f}, {hip:+.2f}]"
-              f"   <- what a real probe leaves on the table")
-        de = macro_faithfulness(pts["probe"]) - macro_faithfulness(pts["entropy"])
+        for new in NEW_ARMS:
+            if new not in pts:
+                continue
+            dn, lon, hin = compare(pts[oracle], pts[new])
+            print(f"  {oracle} - {new:<9}{dn:+7.2f}  [{lon:+.2f}, {hin:+.2f}]")
         print()
-        print(f"  HEADROOM RECOVERED   {100 * de / d if d else float('nan'):.1f}%  "
-              f"of the oracle's {d:+.2f} over entropy")
+        for new in NEW_ARMS:
+            if new not in pts:
+                continue
+            de = macro_faithfulness(pts[new]) - macro_faithfulness(pts["entropy"])
+            print(f"  HEADROOM RECOVERED by {new:<9} "
+                  f"{100 * de / d if d else float('nan'):5.1f}%  "
+                  f"of the oracle's {d:+.2f} over entropy")
 
     out = {"arms": {a: {"macro": macro_faithfulness(pts[a]), "config": cfg[a]}
                     for a in arms},
@@ -516,7 +628,8 @@ def phase_splithalf(unmatched: bool = False):
     perm = rng.permutation(len(qids))
     halves = [set(qids[perm[:len(qids) // 2]]), set(qids[perm[len(qids) // 2:]])]
 
-    arms = [a for a in ("constant", "entropy", "max_prob", "probe") if a in set(sweep.arm)]
+    arms = [a for a in ("constant", "entropy", "max_prob", "probe", "conflict")
+            if a in set(sweep.arm)]
     print("=" * 78)
     print("SPLIT-HALF -- select on one half, measure on the other. Questions disjoint.")
     print("=" * 78)
@@ -539,12 +652,20 @@ def phase_splithalf(unmatched: bool = False):
         print(f"    {a:<12}{macro_faithfulness(pooled[a]):7.2f}")
 
     print()
-    for base in ("entropy", "max_prob", "constant"):
-        if base not in pooled:
+    print("  THIS IS THE HEADLINE FOR THE CONFLICT ARM. It was proposed after seeing the")
+    print("  probe arm's result, so its tuned number is not trustworthy; the held-out one")
+    print("  is.")
+    print()
+    for new in NEW_ARMS:
+        if new not in pooled:
             continue
-        d, lo, hi = compare(pooled["probe"], pooled[base])
-        star = "" if lo > 0 or hi < 0 else "   (CI spans zero)"
-        print(f"  probe - {base:<16}{d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]{star}")
+        for base in ("entropy", "max_prob", "constant"):
+            if base not in pooled:
+                continue
+            d, lo, hi = compare(pooled[new], pooled[base])
+            star = "" if lo > 0 or hi < 0 else "   (CI spans zero)"
+            print(f"  {new} - {base:<16}{d:+7.2f}  [{lo:+.2f}, {hi:+.2f}]{star}")
+        print()
 
 
 # ======================================================================================
@@ -564,7 +685,7 @@ def phase_diag(unmatched: bool = False):
                        sweep_probe(cells, gens)], ignore_index=True)
 
     pts, cfg = {}, {}
-    for a in ("entropy", "probe", "oracle_two_sided", "oracle_one_sided"):
+    for a in ("entropy", "probe", "conflict", "oracle_two_sided", "oracle_one_sided"):
         if a in set(sweep.arm):
             cfg[a], _ = select(sweep, a)
             pts[a] = rows_at(sweep, a, cfg[a])
