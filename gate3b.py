@@ -255,10 +255,30 @@ def build_new_configs(cells: pd.DataFrame) -> list:
     return build_probe_configs(cells) + build_conflict_configs(cells)
 
 
-def sweep_probe(cells: pd.DataFrame, gens: dict) -> pd.DataFrame:
+def available_arms(cells: pd.DataFrame, gens: dict) -> list:
+    """Arms whose every required generation is cached.
+
+    An arm with missing units is SKIPPED LOUDLY, never scored on the rows it happens to
+    have -- the missing units sit on the questions where the signals disagree, so partial
+    scoring would drop exactly the population that decides the comparison.
+    """
+    out = []
+    for arm in NEW_ARMS:
+        miss = units_needed(cells, arms={arm}) - set(gens)
+        if miss:
+            print(f"  SKIPPING arm '{arm}': {len(miss)} generations not cached. "
+                  f"Run `gate3b.py decode` to include it.")
+        else:
+            out.append(arm)
+    return out
+
+
+def sweep_probe(cells: pd.DataFrame, gens: dict, arms=None) -> pd.DataFrame:
     """Score every probe config against the CACHED generations. Pure CPU."""
     recs, misses = [], []
-    for c in build_new_configs(cells):
+    cfgs = [c for c in build_new_configs(cells)
+            if arms is None or c["arm"] in arms]
+    for c in cfgs:
         for r in cells.to_dict("records"):
             tau = _tau(c, r)
             g = gens.get((r["qid"], r["context_kind"], tau))
@@ -533,7 +553,7 @@ def phase_score(unmatched: bool = False):
     cells = attach_probe(load_cells(unmatched), load_probe())
     gens = load_gens()
 
-    probe_sweep = sweep_probe(cells, gens)
+    probe_sweep = sweep_probe(cells, gens, arms=available_arms(cells, gens))
     ref = pd.read_csv(_path("sweep_unmatched.csv" if unmatched else "sweep.csv"))
     sweep = pd.concat([ref, probe_sweep], ignore_index=True)
 
@@ -621,7 +641,8 @@ def phase_splithalf(unmatched: bool = False):
     gens = load_gens()
     sweep = pd.concat([pd.read_csv(_path("sweep_unmatched.csv" if unmatched
                                          else "sweep.csv")),
-                       sweep_probe(cells, gens)], ignore_index=True)
+                       sweep_probe(cells, gens, arms=available_arms(cells, gens))],
+                      ignore_index=True)
 
     qids = np.array(sorted(cells.qid.unique()))
     rng = np.random.default_rng(SEED)
@@ -682,7 +703,8 @@ def phase_diag(unmatched: bool = False):
     gens = load_gens()
     sweep = pd.concat([pd.read_csv(_path("sweep_unmatched.csv" if unmatched
                                          else "sweep.csv")),
-                       sweep_probe(cells, gens)], ignore_index=True)
+                       sweep_probe(cells, gens, arms=available_arms(cells, gens))],
+                      ignore_index=True)
 
     pts, cfg = {}, {}
     for a in ("entropy", "probe", "conflict", "oracle_two_sided", "oracle_one_sided"):
