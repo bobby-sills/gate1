@@ -10,6 +10,7 @@ they were the knowledge signal, and measures faithfulness on the same 1200 insta
 against the same cached generations, with the same statistics.
 
     python gate3b.py check       # coverage, cache hit rate, entropy reproduction
+    python gate3b.py parity      # does THIS GPU reproduce generations.jsonl? A100.
     python gate3b.py decode      # the 518 units Gate 1 never needed -- GPU, RESUMABLE
     python gate3b.py score       # the primary comparison
     python gate3b.py splithalf   # honest deployment estimate (select A, measure B)
@@ -216,6 +217,86 @@ def compare(a: pd.DataFrame, b: pd.DataFrame, seed: int = SEED) -> tuple:
     """
     gate1.RNG = np.random.default_rng(seed)
     return gate1.paired_bootstrap(a, b, n_boot=N_BOOT)
+
+
+# ======================================================================================
+# parity -- does THIS runtime reproduce the generations we are about to sit beside?
+# ======================================================================================
+
+N_PARITY = 50
+
+
+def phase_parity(unmatched: bool = False):
+    """Re-decode units that are ALREADY cached and compare byte-for-byte. Run before
+    `decode`, on the runtime `decode` will use.
+
+    WHY THIS EXISTS. Gate 3b decodes 518 new units and then scores them alongside Gate
+    1's cached generations. Gate 2b established that bf16 kernel selection varies with
+    GPU architecture (GATE2B_PROTOCOL *Hardware*: labels.jsonl reproduces 1793/1793 on an
+    L4 and 0/200 on an A100). If the new units come off a different architecture than the
+    cached ones, the probe arm's generations come from a subtly different decoder than
+    the baselines' -- and the difference lands entirely on the 74 questions where the
+    probe disagrees with both entropy and the label. That is a confound aligned exactly
+    with the effect being measured, so it is checked rather than assumed.
+
+    NOTE THE REQUIRED HARDWARE IS NOT THE SAME AS GATE 3a's. Gate 1's phases ran in
+    separate Colab sessions and landed on different GPUs: `labels` on an L4, `decode` on
+    an A100 (human, 2026-08-07). Gate 3a must match labels.jsonl and therefore wants an
+    L4; Gate 3b must match generations.jsonl and therefore wants an A100. Both are
+    correct. This check is what settles it empirically either way.
+    """
+    cells = attach_probe(load_cells(unmatched), load_probe())
+    gens = load_gens()
+    ctx = {(r["qid"], r["context_kind"]): (r["question"], r["context"])
+           for r in cells.to_dict("records")}
+
+    # Sample from the units the probe arm actually reads, stratified over tau so the
+    # extremes -- where the missing units live -- are represented.
+    pool = sorted(units_needed(cells) & set(gens))
+    by_tau = {}
+    for u in pool:
+        by_tau.setdefault(u[2], []).append(u)
+    rng = np.random.default_rng(SEED)
+    picks, taus = [], sorted(by_tau)
+    for i in range(N_PARITY):
+        bucket = by_tau[taus[i % len(taus)]]
+        picks.append(bucket[int(rng.integers(len(bucket)))])
+    picks = sorted(set(picks))
+
+    print(f"re-decoding {len(picks)} already-cached units across "
+          f"{len(taus)} distinct tau values")
+    t0, rows, exact = time.time(), [], 0
+    for n, (qid, kind, tau) in enumerate(picks, 1):
+        q, c = ctx[(qid, kind)]
+        got = gate1.greedy_decode(q, c, tau)
+        want = gens[(qid, kind, tau)]["text"]
+        ok = got == want
+        exact += ok
+        rows.append({"qid": qid, "context_kind": kind, "tau": tau,
+                     "cached": want, "redecoded": got, "exact": ok})
+        if not ok:
+            print(f"  MISMATCH tau={tau} {qid} {kind}\n"
+                  f"    cached    {want!r}\n    redecoded {got!r}")
+        if n % 10 == 0:
+            print(f"  {n}/{len(picks)}  {exact} exact  "
+                  f"{(time.time() - t0) / n:.2f}s/unit")
+
+    rate = (time.time() - t0) / len(picks)
+    print()
+    print("=" * 78)
+    print(f"EXACT REPRODUCTION  {exact}/{len(picks)}")
+    print("=" * 78)
+    print(f"  {rate:.2f}s/unit -> 518 units projected at {rate * 518 / 60:.1f}min")
+    with open(_path("gate3b_parity.json"), "w") as f:
+        json.dump({"n": len(picks), "exact": exact, "seconds_per_unit": rate,
+                   "rows": rows}, f, indent=2)
+    if exact == len(picks):
+        print("  -> this runtime reproduces generations.jsonl. `decode` is safe here.")
+    else:
+        print("  -> STOP. This runtime does NOT reproduce generations.jsonl, so units")
+        print("     decoded here cannot be scored beside it. Gate 1's `decode` ran on an")
+        print("     A100; get one, or the 518 units are not comparable to the cache.")
+        print("     Do not proceed on the grounds that the mismatch is small.")
 
 
 # ======================================================================================
@@ -544,8 +625,9 @@ def main():
         sys.exit(1)
     cmd = sys.argv[1]
     unmatched = "--unmatched" in sys.argv
-    {"check": phase_check, "decode": phase_decode, "score": phase_score,
-     "splithalf": phase_splithalf, "diag": phase_diag}[cmd](unmatched)
+    {"check": phase_check, "parity": phase_parity, "decode": phase_decode,
+     "score": phase_score, "splithalf": phase_splithalf,
+     "diag": phase_diag}[cmd](unmatched)
 
 
 if __name__ == "__main__":
